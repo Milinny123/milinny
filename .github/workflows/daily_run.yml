@@ -30,6 +30,9 @@ jobs:
       - name: Run ETF Strategy Script
         env:
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          TOTAL_CAPITAL: ${{ vars.TOTAL_CAPITAL }}
+          BUY_MIN: ${{ vars.BUY_MIN }}
+          BUY_MAX: ${{ vars.BUY_MAX }}
         run: python etf_workbench.py
       - name: Commit dashboard update
         run: |
