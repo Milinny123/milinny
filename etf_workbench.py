@@ -23,18 +23,36 @@ MAX_DYNAMIC_CANDIDATES = 12
 MAX_LINKED_FUNDS = 5
 MAX_REPORT_ITEMS = 12
 MAX_DRAWDOWN_LIMIT = -8.0
-BUY_MIN = 100
-BUY_MAX = 250
+MAX_DATA_AGE_DAYS = 10
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, "").strip() or default)
+        return value if value > 0 else default
+    except ValueError:
+        return default
+
+
+def _round_to_50(value: float) -> int:
+    return max(50, int(math.floor(value / 50 + 0.5) * 50))
+
+
+TOTAL_CAPITAL = _positive_int_env("TOTAL_CAPITAL", 2000)
+BUY_MIN = _positive_int_env("BUY_MIN", 100)
+BUY_MAX = max(BUY_MIN, _positive_int_env("BUY_MAX", 250))
+STANDARD_BUY = min(BUY_MAX, max(BUY_MIN, _round_to_50(TOTAL_CAPITAL * 0.10)))
+HIGH_CONVICTION_BUY = min(BUY_MAX, max(BUY_MIN, _round_to_50(TOTAL_CAPITAL * 0.125)))
 BENCHMARK = {"code": "510300", "name": "沪深300ETF", "kind": "benchmark", "data_codes": ("510300",)}
 
-# 000852 按用户给定的请求代码保留；该名称在部分数据源实际对应 007339，作为数据回退。
+# 场外基金代码已按基金管理人官网/产品资料核验；代码与名称不得分离修改。
 CORE_WATCHLIST: list[dict[str, Any]] = [
-    {"code": "012616", "name": "华夏半导体芯片ETF联接C", "kind": "alipay_c", "data_codes": ("012616",)},
-    {"code": "011613", "name": "易方达中证科创50联接C", "kind": "alipay_c", "data_codes": ("011613",)},
-    {"code": "015874", "name": "富国中证人工智能ETF联接C", "kind": "alipay_c", "data_codes": ("015874",)},
-    {"code": "000852", "name": "易方达沪深300联接C", "kind": "alipay_c", "data_codes": ("000852", "007339")},
-    {"code": "012414", "name": "招商中证消费电子主题ETF联接C", "kind": "alipay_c", "data_codes": ("012414",)},
-    {"code": "013280", "name": "易方达中证医疗ETF联接C", "kind": "alipay_c", "data_codes": ("013280",)},
+    {"code": "008888", "name": "华夏国证半导体芯片ETF联接C", "kind": "alipay_c", "data_codes": ("008888",)},
+    {"code": "011613", "name": "华夏科创50ETF联接C", "kind": "alipay_c", "data_codes": ("011613",)},
+    {"code": "024663", "name": "富国创业板人工智能ETF发起式联接C", "kind": "alipay_c", "data_codes": ("024663",)},
+    {"code": "007339", "name": "易方达沪深300ETF联接C", "kind": "alipay_c", "data_codes": ("007339",)},
+    {"code": "016008", "name": "招商中证消费电子主题ETF联接C", "kind": "alipay_c", "data_codes": ("016008",)},
+    {"code": "017938", "name": "易方达中证医疗ETF联接发起式C", "kind": "alipay_c", "data_codes": ("017938",)},
     {"code": "588000", "name": "科创50ETF", "kind": "etf", "data_codes": ("588000",)},
     {"code": "512480", "name": "半导体ETF", "kind": "etf", "data_codes": ("512480",)},
 ]
@@ -232,8 +250,42 @@ def match_linked_c_fund(etf: dict[str, Any], catalog: pd.DataFrame) -> dict[str,
     return {"code": best[1], "name": best[2], "kind": "linked_c", "data_codes": (best[1],), "matched_etf": etf["code"]}
 
 
+def _validate_core_funds(
+    items: list[dict[str, Any]], catalog: pd.DataFrame, failures: list[str]
+) -> list[dict[str, Any]]:
+    names = dict(zip(catalog["code"].astype(str).str.zfill(6), catalog["name"].astype(str)))
+    verified: list[dict[str, Any]] = []
+    for item in items:
+        if item["kind"] != "alipay_c":
+            verified.append(item)
+            continue
+        official_name = names.get(item["code"])
+        if official_name is None:
+            failures.append(f"{item['code']} {item['name']}：基金目录未找到该代码，已跳过")
+            continue
+        similarity = SequenceMatcher(
+            None, _clean_fund_name(item["name"]), _clean_fund_name(official_name)
+        ).ratio()
+        if similarity < 0.55:
+            failures.append(
+                f"{item['code']} 代码名称核验失败：配置为“{item['name']}”，官方目录为“{official_name}”，已跳过"
+            )
+            continue
+        checked = dict(item)
+        checked["name"] = official_name
+        checked["name_verified"] = True
+        verified.append(checked)
+    return verified
+
+
 def build_watchlist(failures: list[str]) -> tuple[list[dict[str, Any]], int]:
     items = [dict(item) for item in CORE_WATCHLIST]
+    catalog: pd.DataFrame | None = None
+    try:
+        catalog = _fund_catalog()
+        items = _validate_core_funds(items, catalog, failures)
+    except Exception as exc:
+        failures.append(f"核心基金代码名称在线核验失败：{_short_error(exc)}")
     existing = {item["code"] for item in items}
     dynamic_count = 0
     try:
@@ -248,7 +300,8 @@ def build_watchlist(failures: list[str]) -> tuple[list[dict[str, Any]], int]:
 
     if dynamic_count:
         try:
-            catalog = _fund_catalog()
+            if catalog is None:
+                catalog = _fund_catalog()
             matched = 0
             for item in items:
                 if not item.get("dynamic") or matched >= MAX_LINKED_FUNDS:
@@ -267,7 +320,9 @@ def _return(close: pd.Series, days: int) -> float:
     return (float(close.iloc[-1]) / float(close.iloc[-1 - days]) - 1) * 100
 
 
-def analyse_item(item: dict[str, Any], benchmark_returns: dict[int, float]) -> dict[str, Any]:
+def analyse_item(
+    item: dict[str, Any], benchmark_returns: dict[int, float], as_of: datetime
+) -> dict[str, Any]:
     history, data_code, source = fetch_item_history(item)
     if len(history) < 61:
         raise ValueError(f"有效数据 {len(history)} 条，少于 61 条")
@@ -278,6 +333,8 @@ def analyse_item(item: dict[str, Any], benchmark_returns: dict[int, float]) -> d
     ma60 = float(close.tail(60).mean())
     high20 = float(close.tail(20).max())
     drawdown = (latest / high20 - 1) * 100
+    data_date = history["date"].iloc[-1].date()
+    data_age_days = (as_of.astimezone(BEIJING_TZ).date() - data_date).days
     score = returns[5] * 0.5 + returns[20] * 0.3 + returns[60] * 0.2
     rs20 = returns[20] - benchmark_returns.get(20, 0.0)
     rs60 = returns[60] - benchmark_returns.get(60, 0.0)
@@ -285,6 +342,9 @@ def analyse_item(item: dict[str, Any], benchmark_returns: dict[int, float]) -> d
         **item,
         "data_code": data_code,
         "source": source,
+        "data_date": data_date.isoformat(),
+        "data_age_days": data_age_days,
+        "stale": data_age_days > MAX_DATA_AGE_DAYS,
         "latest": latest,
         "r5": returns[5],
         "r20": returns[20],
@@ -311,12 +371,19 @@ def _rank_results(results: list[dict[str, Any]]) -> None:
         item["rank"] = rank
         item["pool_percentile"] = round((total - rank + 1) / total * 100, 1)
         item["pool_top_percent"] = max(1, math.ceil(rank / total * 100))
-        if item["stop"]:
+        if item["stale"]:
+            item["action"] = "数据过期"
+            item["amount"] = 0
+        elif item["stop"]:
             item["action"] = "风控止损"
             item["amount"] = 0
         elif item["score"] > 0 and item["above_ma20"] and item["above_ma60"] and item["pool_percentile"] >= 70:
             item["action"] = "买入观察"
-            item["amount"] = 250 if item["pool_percentile"] >= 90 and item["score"] >= 4 else 200
+            item["amount"] = (
+                HIGH_CONVICTION_BUY
+                if item["pool_percentile"] >= 90 and item["score"] >= 4
+                else STANDARD_BUY
+            )
         elif item["above_ma20"]:
             item["action"] = "持有/观察"
             item["amount"] = 0
@@ -333,17 +400,23 @@ def analyse_market(now: datetime | None = None) -> dict[str, Any]:
     failures: list[str] = []
     watchlist, dynamic_count = build_watchlist(failures)
     benchmark_returns: dict[int, float] = {}
+    benchmark_date = ""
     try:
         benchmark_history, _, _ = fetch_item_history(BENCHMARK)
         if len(benchmark_history) >= 61:
-            benchmark_returns = {days: _return(benchmark_history["close"], days) for days in (5, 20, 60)}
+            benchmark_date = benchmark_history["date"].iloc[-1].date().isoformat()
+            benchmark_age = (now.astimezone(BEIJING_TZ).date() - benchmark_history["date"].iloc[-1].date()).days
+            if benchmark_age > MAX_DATA_AGE_DAYS:
+                failures.append(f"沪深300基准数据过期：最新日期 {benchmark_date}")
+            else:
+                benchmark_returns = {days: _return(benchmark_history["close"], days) for days in (5, 20, 60)}
     except Exception as exc:
         failures.append(f"沪深300基准：{_short_error(exc)}")
 
     results: list[dict[str, Any]] = []
     for item in watchlist:
         try:
-            results.append(analyse_item(item, benchmark_returns))
+            results.append(analyse_item(item, benchmark_returns, now))
         except Exception as exc:
             failures.append(f"{item['code']} {item['name']}：{_short_error(exc)}")
     _rank_results(results)
@@ -356,10 +429,13 @@ def analyse_market(now: datetime | None = None) -> dict[str, Any]:
         "dynamic_count": dynamic_count,
         "watch_count": len(watchlist),
         "benchmark_returns": benchmark_returns,
+        "benchmark_date": benchmark_date,
     }
 
 
 def _action_text(item: dict[str, Any]) -> str:
+    if item["stale"]:
+        return f"数据过期（最新 {item['data_date']}），停止给出交易信号"
     if item["stop"]:
         if item["kind"] in {"alipay_c", "linked_c"}:
             return "风控止损；持有未满 7 天非极端暴跌请勿赎回，满 7 天后再考虑约 200 元分批平仓"
@@ -377,7 +453,7 @@ def _line(item: dict[str, Any]) -> str:
         f"- **{item['code']} {item['name']}**（{item['kind']}）：5/20/60日 "
         f"{item['r5']:.2f}% / {item['r20']:.2f}% / {item['r60']:.2f}%，动量 **{item['score']:.2f}**，"
         f"池内分位 **{item['pool_percentile']:.1f}%**（约前 {item['pool_top_percent']}%）；"
-        f"{trend}，相对沪深300超额20/60日 {item['rs20']:.2f}% / {item['rs60']:.2f}%，"
+        f"数据日期 {item['data_date']}，{trend}，相对沪深300超额20/60日 {item['rs20']:.2f}% / {item['rs60']:.2f}%，"
         f"回撤 {item['drawdown']:.2f}%，**{_action_text(item)}**。"
     )
 
@@ -394,7 +470,7 @@ def build_report(context: dict[str, Any]) -> tuple[str, str]:
         f"扫描 {context['watch_count']} 个候选（动态 ETF {context['dynamic_count']} 个），有效分析 {len(results)} 个。",
         "",
         "## 沪深300基准",
-        f"5/20/60日：{benchmark.get(5, 0):.2f}% / {benchmark.get(20, 0):.2f}% / {benchmark.get(60, 0):.2f}%",
+        f"数据日期：{context['benchmark_date'] or '未获取'}；5/20/60日：{benchmark.get(5, 0):.2f}% / {benchmark.get(20, 0):.2f}% / {benchmark.get(60, 0):.2f}%",
         "",
         "## 动量与深度归因 Top 榜",
     ]
@@ -402,7 +478,7 @@ def build_report(context: dict[str, Any]) -> tuple[str, str]:
     if mode == "morning":
         lines += ["", "**早盘焦点：** 优先观察池内分位靠前、同时站上 MA20/MA60 且相对沪深300为正的标的，开盘不追高。"]
     else:
-        lines += ["", "**尾盘纪律：** 单笔加仓严格控制在 100～250 元，2000 元总资金分批操作，不因单日波动满仓。"]
+        lines += ["", f"**尾盘纪律：** 单笔加仓严格控制在 {BUY_MIN}～{BUY_MAX} 元，{TOTAL_CAPITAL} 元总资金分批操作，不因单日波动满仓。"]
     lines += [
         "",
         "**支付宝 C 类风控：** 支付宝 C 类持有未满 7 天赎回将收取 1.5% 惩罚性手续费，非暴跌请满 7 天后再平仓。",
@@ -420,6 +496,7 @@ def _dashboard_row(item: dict[str, Any]) -> str:
     return (
         f"<tr data-kind='{html.escape(item['kind'])}'><td>{item['rank']}</td>"
         f"<td><strong>{html.escape(item['name'])}</strong><small>{html.escape(item['code'])} · {kind_label}</small></td>"
+        f"<td>{html.escape(item['data_date'])}</td>"
         f"<td>{item['score']:.2f}</td><td>{item['pool_percentile']:.1f}%</td>"
         f"<td>{item['r20']:.2f}%<br><small>RS {item['rs20']:.2f}%</small></td>"
         f"<td>{'是' if item['above_ma20'] else '否'} / {'是' if item['above_ma60'] else '否'}</td>"
@@ -458,11 +535,11 @@ main {{ max-width:1240px; margin:0 auto; padding:32px 20px 56px; }} header {{ di
 .positive {{ color:var(--green); font-weight:700; }} .danger {{ color:var(--red); font-weight:700; }} .neutral {{ color:#8a5a00; }} .notes {{ padding:16px; margin-top:16px; }} .notes h2 {{ font-size:16px; margin:0 0 8px; }} .notes ul {{ margin:8px 0 0; padding-left:20px; color:var(--muted); }}
 @media (max-width:700px) {{ main {{ padding:22px 12px 40px; }} header {{ display:block; }} .stamp {{ text-align:left; margin-top:10px; }} .stats {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .toolbar {{ flex-direction:column; }} }}
 </style></head><body><main>
-<header><div><div class="eyebrow">ETF WORKBENCH · 2000 CNY MODE</div><h1>{html.escape(title)}</h1><p>全市场动量、相对沪深300强弱与风险回撤的可视化筛选。</p></div><div class="stamp">更新时间<br><strong>{now:%Y-%m-%d %H:%M} 北京时间</strong></div></header>
+<header><div><div class="eyebrow">ETF WORKBENCH · {TOTAL_CAPITAL} CNY MODE</div><h1>{html.escape(title)}</h1><p>全市场动量、相对沪深300强弱与风险回撤的可视化筛选。</p></div><div class="stamp">更新时间<br><strong>{now:%Y-%m-%d %H:%M} 北京时间</strong></div></header>
 <section class="stats"><div class="stat"><span>有效标的</span><b>{len(results)}</b></div><div class="stat"><span>动态扫描 ETF</span><b>{context['dynamic_count']}</b></div><div class="stat"><span>买入观察</span><b>{sum(item['action'] == '买入观察' for item in results)}</b></div><div class="stat"><span>触发风控</span><b>{sum(item['stop'] for item in results)}</b></div></section>
 <div class="toolbar"><input id="search" type="search" placeholder="搜索名称或代码"><select id="kind"><option value="all">全部标的</option><option value="alipay_c">支付宝 C 类</option><option value="linked_c">自动匹配 C 类</option><option value="etf">场内 ETF</option></select></div>
-<section class="table-panel"><table><thead><tr><th>排名</th><th>标的</th><th>动量得分</th><th>池内分位</th><th>20日收益 / RS</th><th>MA20 / MA60</th><th>20日回撤</th><th>动作与依据</th></tr></thead><tbody id="rows">{rows}</tbody></table></section>
-<section class="notes"><h2>风控与数据状态</h2><p>单笔加仓控制在 100～250 元；支付宝 C 类持有未满 7 天赎回将收取 1.5% 惩罚性手续费，非暴跌请满 7 天后再平仓。</p>{f'<ul>{failures}</ul>' if failures else '<p>本次扫描未记录接口失败。</p>'}</section>
+<section class="table-panel"><table><thead><tr><th>排名</th><th>标的</th><th>数据日期</th><th>动量得分</th><th>池内分位</th><th>20日收益 / RS</th><th>MA20 / MA60</th><th>20日回撤</th><th>动作与依据</th></tr></thead><tbody id="rows">{rows}</tbody></table></section>
+<section class="notes"><h2>风控与数据状态</h2><p>总资金 {TOTAL_CAPITAL} 元，单笔加仓控制在 {BUY_MIN}～{BUY_MAX} 元；支付宝 C 类持有未满 7 天赎回将收取 1.5% 惩罚性手续费，非暴跌请满 7 天后再平仓。</p>{f'<ul>{failures}</ul>' if failures else '<p>本次扫描未记录接口失败。</p>'}</section>
 <script type="application/json" id="dashboard-data">{data_json}</script><script>
 const data=JSON.parse(document.getElementById('dashboard-data').textContent); const search=document.getElementById('search'); const kind=document.getElementById('kind');
 function filterRows(){{const q=search.value.trim().toLowerCase(), k=kind.value; document.querySelectorAll('#rows tr').forEach(row=>{{const text=row.textContent.toLowerCase(); row.hidden=(q&&!text.includes(q))||(k!=='all'&&row.dataset.kind!==k);}});}}
