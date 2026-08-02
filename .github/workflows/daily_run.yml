@@ -45,11 +45,14 @@ jobs:
             git push
           fi
       - name: Configure GitHub Pages
+        if: vars.ENABLE_PAGES == 'true'
         uses: actions/configure-pages@v5
       - name: Upload dashboard artifact
+        if: vars.ENABLE_PAGES == 'true'
         uses: actions/upload-pages-artifact@v3
         with:
           path: .
       - name: Deploy dashboard to GitHub Pages
+        if: vars.ENABLE_PAGES == 'true'
         id: deployment
         uses: actions/deploy-pages@v4
