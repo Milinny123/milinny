@@ -8,11 +8,9 @@ on:
 
 permissions:
   contents: write
-  pages: write
-  id-token: write
 
 concurrency:
-  group: pages
+  group: etf-momentum-screener
   cancel-in-progress: false
 
 jobs:
@@ -44,15 +42,27 @@ jobs:
             git commit -m "Update ETF dashboard"
             git push
           fi
-      - name: Configure GitHub Pages
-        if: vars.ENABLE_PAGES == 'true'
-        uses: actions/configure-pages@v5
-      - name: Upload dashboard artifact
-        if: vars.ENABLE_PAGES == 'true'
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: .
-      - name: Deploy dashboard to GitHub Pages
-        if: vars.ENABLE_PAGES == 'true'
-        id: deployment
-        uses: actions/deploy-pages@v4
+      - name: Publish public dashboard
+        env:
+          DASHBOARD_DEPLOY_KEY: ${{ secrets.DASHBOARD_DEPLOY_KEY }}
+        run: |
+          if [ -z "$DASHBOARD_DEPLOY_KEY" ]; then
+            echo "DASHBOARD_DEPLOY_KEY is not configured."
+            exit 1
+          fi
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DASHBOARD_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+          git clone git@github.com:Milinny123/etf-momentum-dashboard.git "$RUNNER_TEMP/etf-momentum-dashboard"
+          cp index.html "$RUNNER_TEMP/etf-momentum-dashboard/index.html"
+          cd "$RUNNER_TEMP/etf-momentum-dashboard"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          if git diff --cached --quiet; then
+            echo "No public dashboard changes to publish."
+          else
+            git commit -m "Update ETF dashboard"
+            git push origin main
+          fi
