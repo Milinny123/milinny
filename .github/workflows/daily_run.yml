@@ -2,8 +2,9 @@ name: Daily ETF & Fund Momentum Screener
 
 on:
   schedule:
-    - cron: '0 1 * * 1-5'
-    - cron: '30 6 * * 1-5'
+    # Avoid GitHub Actions' high-load periods at the start of each hour.
+    - cron: '50 0 * * 1-5'
+    - cron: '20 6 * * 1-5'
   workflow_dispatch:
 
 permissions:
