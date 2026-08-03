@@ -69,6 +69,7 @@ jobs:
           BUY_MIN: ${{ vars.BUY_MIN }}
           BUY_MAX: ${{ vars.BUY_MAX }}
           BROKER_MIN_COMMISSION: ${{ vars.BROKER_MIN_COMMISSION }}
+          INTRADAY_MAX_ROUND_TRIP_COST_PCT: ${{ vars.INTRADAY_MAX_ROUND_TRIP_COST_PCT }}
         run: |
           set -o pipefail
           python etf_workbench.py | tee strategy.log
