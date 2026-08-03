@@ -20,16 +20,25 @@ import requests
 BEIJING_TZ = timezone(timedelta(hours=8))
 HISTORY_ROWS = 150
 MAX_DYNAMIC_CANDIDATES = 12
-MAX_LINKED_FUNDS = 5
+MAX_LINKED_FUNDS = 10
 MAX_REPORT_ITEMS = 12
 MAX_DRAWDOWN_LIMIT = -8.0
 MAX_DATA_AGE_DAYS = 10
+MAX_EXCHANGE_ROUND_TRIP_COST_PCT = 1.0
 
 
 def _positive_int_env(name: str, default: int) -> int:
     try:
         value = int(os.getenv(name, "").strip() or default)
         return value if value > 0 else default
+    except ValueError:
+        return default
+
+
+def _non_negative_float_env(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, "").strip() or default)
+        return value if value >= 0 else default
     except ValueError:
         return default
 
@@ -43,6 +52,7 @@ BUY_MIN = _positive_int_env("BUY_MIN", 100)
 BUY_MAX = max(BUY_MIN, _positive_int_env("BUY_MAX", 250))
 STANDARD_BUY = min(BUY_MAX, max(BUY_MIN, _round_to_50(TOTAL_CAPITAL * 0.10)))
 HIGH_CONVICTION_BUY = min(BUY_MAX, max(BUY_MIN, _round_to_50(TOTAL_CAPITAL * 0.125)))
+BROKER_MIN_COMMISSION = _non_negative_float_env("BROKER_MIN_COMMISSION", 10.0)
 BENCHMARK = {"code": "510300", "name": "沪深300ETF", "kind": "benchmark", "data_codes": ("510300",)}
 
 # 场外基金代码已按基金管理人官网/产品资料核验；代码与名称不得分离修改。
@@ -53,6 +63,13 @@ CORE_WATCHLIST: list[dict[str, Any]] = [
     {"code": "007339", "name": "易方达沪深300ETF联接C", "kind": "alipay_c", "data_codes": ("007339",)},
     {"code": "016008", "name": "招商中证消费电子主题ETF联接C", "kind": "alipay_c", "data_codes": ("016008",)},
     {"code": "017938", "name": "易方达中证医疗ETF联接发起式C", "kind": "alipay_c", "data_codes": ("017938",)},
+    {"code": "006328", "name": "易方达中证海外互联网50ETF联接(QDII)C", "kind": "alipay_c", "data_codes": ("006328",)},
+    {"code": "012349", "name": "天弘恒生科技ETF联接C", "kind": "alipay_c", "data_codes": ("012349",)},
+    {"code": "012729", "name": "国泰中证动漫游戏ETF联接C", "kind": "alipay_c", "data_codes": ("012729",)},
+    {"code": "012637", "name": "国泰中证全指软件ETF联接C", "kind": "alipay_c", "data_codes": ("012637",)},
+    {"code": "004070", "name": "南方中证全指证券公司ETF联接C", "kind": "alipay_c", "data_codes": ("004070",)},
+    {"code": "007467", "name": "华泰柏瑞中证红利低波ETF联接C", "kind": "alipay_c", "data_codes": ("007467",)},
+    {"code": "000217", "name": "华安黄金ETF联接C", "kind": "alipay_c", "data_codes": ("000217",)},
     {"code": "588000", "name": "科创50ETF", "kind": "etf", "data_codes": ("588000",)},
     {"code": "512480", "name": "半导体ETF", "kind": "etf", "data_codes": ("512480",)},
 ]
@@ -285,7 +302,8 @@ def build_watchlist(failures: list[str]) -> tuple[list[dict[str, Any]], int]:
         catalog = _fund_catalog()
         items = _validate_core_funds(items, catalog, failures)
     except Exception as exc:
-        failures.append(f"核心基金代码名称在线核验失败：{_short_error(exc)}")
+        failures.append(f"核心基金代码名称在线核验失败，场外基金已全部跳过：{_short_error(exc)}")
+        items = [item for item in items if item["kind"] != "alipay_c"]
     existing = {item["code"] for item in items}
     dynamic_count = 0
     try:
@@ -359,6 +377,7 @@ def analyse_item(
         "rs20": rs20,
         "rs60": rs60,
         "rs_score": rs20 * 0.6 + rs60 * 0.4,
+        "benchmark_verified": bool(benchmark_returns),
     }
 
 
@@ -374,22 +393,88 @@ def _rank_results(results: list[dict[str, Any]]) -> None:
         if item["stale"]:
             item["action"] = "数据过期"
             item["amount"] = 0
+        elif not item["benchmark_verified"]:
+            item["action"] = "基准缺失"
+            item["amount"] = 0
         elif item["stop"]:
             item["action"] = "风控止损"
             item["amount"] = 0
-        elif item["score"] > 0 and item["above_ma20"] and item["above_ma60"] and item["pool_percentile"] >= 70:
-            item["action"] = "买入观察"
-            item["amount"] = (
+        elif (
+            item["score"] > 0
+            and item["above_ma20"]
+            and item["above_ma60"]
+            and item["pool_percentile"] >= 70
+            and item["rs20"] > 0
+            and item["rs_score"] > 0
+        ):
+            proposed_amount = (
                 HIGH_CONVICTION_BUY
                 if item["pool_percentile"] >= 90 and item["score"] >= 4
                 else STANDARD_BUY
             )
+            item["suggested_amount"] = proposed_amount
+            if item["kind"] == "etf" and BROKER_MIN_COMMISSION > 0:
+                round_trip_cost = BROKER_MIN_COMMISSION * 2
+                cost_pct = round_trip_cost / proposed_amount * 100
+                item["exchange_round_trip_cost"] = round_trip_cost
+                item["exchange_round_trip_cost_pct"] = cost_pct
+                if cost_pct > MAX_EXCHANGE_ROUND_TRIP_COST_PCT:
+                    item["action"] = "场内成本过高"
+                    item["amount"] = 0
+                    continue
+            item["action"] = "买入观察"
+            item["amount"] = proposed_amount
         elif item["above_ma20"]:
             item["action"] = "持有/观察"
             item["amount"] = 0
         else:
             item["action"] = "暂缓/观望"
             item["amount"] = 0
+
+
+def _redemption_fee_summary(frame: pd.DataFrame) -> tuple[str, int | None]:
+    term_col = _first_existing(frame, ("适用期限", "持有期限", "期限"))
+    rate_col = _first_existing(frame, ("赎回费率", "费率"))
+    if not term_col or not rate_col or frame.empty:
+        raise ValueError(f"无法识别赎回费率列: {list(frame.columns)}")
+    rows: list[str] = []
+    fee_free_days: list[int] = []
+    for _, row in frame.iterrows():
+        term = str(row[term_col]).strip()
+        rate = str(row[rate_col]).strip()
+        if not term or not rate or term == "nan" or rate == "nan":
+            continue
+        rows.append(f"{term} {rate}")
+        numeric_rate = pd.to_numeric(rate.replace("%", ""), errors="coerce")
+        if pd.notna(numeric_rate) and float(numeric_rate) == 0:
+            match = re.search(r"(?:大于等于|不少于|满)(\d+)天", term)
+            if match:
+                fee_free_days.append(int(match.group(1)))
+    if not rows:
+        raise ValueError("赎回费率为空")
+    return "；".join(rows), min(fee_free_days) if fee_free_days else None
+
+
+def enrich_redemption_fees(results: list[dict[str, Any]], failures: list[str]) -> None:
+    """Verify redemption fees for C-class funds that otherwise qualify for buying."""
+    for item in results:
+        if item["kind"] not in {"alipay_c", "linked_c"} or item["action"] != "买入观察":
+            continue
+        try:
+            fee_frame = ak.fund_fee_em(symbol=item["code"], indicator="赎回费率")
+            summary, fee_free_days = _redemption_fee_summary(fee_frame)
+            item["fee_verified"] = True
+            item["redemption_fee_summary"] = summary
+            item["fee_free_days"] = fee_free_days
+            if fee_free_days is None:
+                item["action"] = "费率待核验"
+                item["amount"] = 0
+                failures.append(f"{item['code']} {item['name']}：未识别到零赎回费持有期限，已取消买入信号")
+        except Exception as exc:
+            item["fee_verified"] = False
+            item["action"] = "费率待核验"
+            item["amount"] = 0
+            failures.append(f"{item['code']} {item['name']}赎回费率：{_short_error(exc)}，已取消买入信号")
 
 
 def analyse_market(now: datetime | None = None) -> dict[str, Any]:
@@ -420,6 +505,7 @@ def analyse_market(now: datetime | None = None) -> dict[str, Any]:
         except Exception as exc:
             failures.append(f"{item['code']} {item['name']}：{_short_error(exc)}")
     _rank_results(results)
+    enrich_redemption_fees(results, failures)
     results.sort(key=lambda row: row["score"], reverse=True)
     return {
         "now": now,
@@ -436,11 +522,27 @@ def analyse_market(now: datetime | None = None) -> dict[str, Any]:
 def _action_text(item: dict[str, Any]) -> str:
     if item["stale"]:
         return f"数据过期（最新 {item['data_date']}），停止给出交易信号"
+    if not item["benchmark_verified"]:
+        return "沪深300基准缺失，停止给出交易信号"
     if item["stop"]:
         if item["kind"] in {"alipay_c", "linked_c"}:
-            return "风控止损；持有未满 7 天非极端暴跌请勿赎回，满 7 天后再考虑约 200 元分批平仓"
+            return "风控止损；赎回前必须核对支付宝页面的实际持有天数和赎回费率"
         return "风控止损；建议减仓约 200 元"
+    if item["action"] == "场内成本过高":
+        return (
+            f"仅观察，不下单；按 {item.get('suggested_amount', 0)} 元试仓计算，买卖最低佣金合计 "
+            f"{item.get('exchange_round_trip_cost', 0):.0f} 元，往返成本 {item.get('exchange_round_trip_cost_pct', 0):.2f}%"
+        )
+    if item["action"] == "费率待核验":
+        return "赎回费率未能实时核验，停止给出买入信号"
     if item["action"] == "买入观察":
+        if item["kind"] in {"alipay_c", "linked_c"}:
+            holding = item.get("fee_free_days")
+            holding_text = f"计划至少持有 {holding} 天" if holding else "赎回前再次核对费率"
+            return (
+                f"动量与趋势共振，建议在支付宝分批买入 {item['amount']} 元；{holding_text}；"
+                f"当前费率规则：{item.get('redemption_fee_summary', '未获取')}"
+            )
         return f"动量与趋势共振，建议分批买入 {item['amount']} 元"
     if item["action"] == "持有/观察":
         return "站上 MA20，继续观察，不新增资金"
@@ -462,6 +564,8 @@ def build_report(context: dict[str, Any]) -> tuple[str, str]:
     now: datetime = context["now"]
     mode = context["mode"]
     results = context["results"]
+    c_class_results = [item for item in results if item["kind"] in {"alipay_c", "linked_c"}]
+    exchange_results = [item for item in results if item["kind"] == "etf"]
     title = "早盘全市场风向与动量预选" if mode == "morning" else "支付宝 14:30 实操买卖指南"
     benchmark = context["benchmark_returns"]
     lines = [
@@ -472,16 +576,20 @@ def build_report(context: dict[str, Any]) -> tuple[str, str]:
         "## 沪深300基准",
         f"数据日期：{context['benchmark_date'] or '未获取'}；5/20/60日：{benchmark.get(5, 0):.2f}% / {benchmark.get(20, 0):.2f}% / {benchmark.get(60, 0):.2f}%",
         "",
-        "## 动量与深度归因 Top 榜",
+        "## 支付宝场外 C 类优先榜",
     ]
-    lines.extend(_line(item) for item in results[:MAX_REPORT_ITEMS])
+    lines.extend(_line(item) for item in c_class_results[:MAX_REPORT_ITEMS])
+    lines += ["", "## 场内 ETF 观察榜（已计入最低佣金）"]
+    lines.extend(_line(item) for item in exchange_results[:6])
     if mode == "morning":
         lines += ["", "**早盘焦点：** 优先观察池内分位靠前、同时站上 MA20/MA60 且相对沪深300为正的标的，开盘不追高。"]
     else:
         lines += ["", f"**尾盘纪律：** 单笔加仓严格控制在 {BUY_MIN}～{BUY_MAX} 元，{TOTAL_CAPITAL} 元总资金分批操作，不因单日波动满仓。"]
     lines += [
         "",
-        "**支付宝 C 类风控：** 支付宝 C 类持有未满 7 天赎回将收取 1.5% 惩罚性手续费，非暴跌请满 7 天后再平仓。",
+        f"**场内成本过滤：** 按买入、卖出各最低 {BROKER_MIN_COMMISSION:.0f} 元佣金计算；往返成本超过 {MAX_EXCHANGE_ROUND_TRIP_COST_PCT:.1f}% 时只观察、不下单。",
+        "",
+        "**支付宝 C 类风控：** 不同基金赎回费规则不同；脚本会实时核验出现买入信号的基金，必须按报告给出的免赎回费持有期限执行，并以支付宝购买页为最终依据。",
         "",
         "**免责声明：** 本报告由量化脚本自动生成，仅供研究参考，不构成投资建议。",
     ]
@@ -539,7 +647,7 @@ main {{ max-width:1240px; margin:0 auto; padding:32px 20px 56px; }} header {{ di
 <section class="stats"><div class="stat"><span>有效标的</span><b>{len(results)}</b></div><div class="stat"><span>动态扫描 ETF</span><b>{context['dynamic_count']}</b></div><div class="stat"><span>买入观察</span><b>{sum(item['action'] == '买入观察' for item in results)}</b></div><div class="stat"><span>触发风控</span><b>{sum(item['stop'] for item in results)}</b></div></section>
 <div class="toolbar"><input id="search" type="search" placeholder="搜索名称或代码"><select id="kind"><option value="all">全部标的</option><option value="alipay_c">支付宝 C 类</option><option value="linked_c">自动匹配 C 类</option><option value="etf">场内 ETF</option></select></div>
 <section class="table-panel"><table><thead><tr><th>排名</th><th>标的</th><th>数据日期</th><th>动量得分</th><th>池内分位</th><th>20日收益 / RS</th><th>MA20 / MA60</th><th>20日回撤</th><th>动作与依据</th></tr></thead><tbody id="rows">{rows}</tbody></table></section>
-<section class="notes"><h2>风控与数据状态</h2><p>总资金 {TOTAL_CAPITAL} 元，单笔加仓控制在 {BUY_MIN}～{BUY_MAX} 元；支付宝 C 类持有未满 7 天赎回将收取 1.5% 惩罚性手续费，非暴跌请满 7 天后再平仓。</p>{f'<ul>{failures}</ul>' if failures else '<p>本次扫描未记录接口失败。</p>'}</section>
+<section class="notes"><h2>风控与数据状态</h2><p>总资金 {TOTAL_CAPITAL} 元，单笔加仓控制在 {BUY_MIN}～{BUY_MAX} 元。场内 ETF 按买卖各最低 {BROKER_MIN_COMMISSION:.0f} 元佣金过滤，往返成本超过 {MAX_EXCHANGE_ROUND_TRIP_COST_PCT:.1f}% 时只观察；支付宝 C 类按实时赎回费率给出最低计划持有天数，最终以购买页为准。</p>{f'<ul>{failures}</ul>' if failures else '<p>本次扫描未记录接口失败。</p>'}</section>
 <script type="application/json" id="dashboard-data">{data_json}</script><script>
 const data=JSON.parse(document.getElementById('dashboard-data').textContent); const search=document.getElementById('search'); const kind=document.getElementById('kind');
 function filterRows(){{const q=search.value.trim().toLowerCase(), k=kind.value; document.querySelectorAll('#rows tr').forEach(row=>{{const text=row.textContent.toLowerCase(); row.hidden=(q&&!text.includes(q))||(k!=='all'&&row.dataset.kind!==k);}});}}
