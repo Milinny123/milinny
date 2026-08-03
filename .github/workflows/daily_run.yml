@@ -2,9 +2,10 @@ name: Daily ETF & Fund Momentum Screener
 
 on:
   schedule:
-    # Avoid GitHub Actions' high-load periods at the start of each hour.
-    - cron: '50 0 * * 1-5'
-    - cron: '20 6 * * 1-5'
+    # Redundant trigger windows; a daily cache lock prevents duplicate pushes.
+    - cron: '45,55 0 * * 1-5'
+    - cron: '5 1 * * 1-5'
+    - cron: '10,20,30 6 * * 1-5'
   workflow_dispatch:
 
 permissions:
@@ -19,23 +20,71 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+      - name: Resolve Beijing push slot
+        id: slot
+        run: |
+          bj_date=$(TZ=Asia/Shanghai date +%F)
+          bj_hour=$(TZ=Asia/Shanghai date +%H)
+          if [ "$bj_hour" -lt 12 ]; then
+            push_mode=morning
+          else
+            push_mode=evening
+          fi
+          echo "key=etf-push-${bj_date}-${push_mode}" >> "$GITHUB_OUTPUT"
+      - name: Check whether this slot was already pushed
+        id: push-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: .push-state
+          key: ${{ steps.slot.outputs.key }}
+          lookup-only: true
+      - name: Decide whether to run
+        id: decision
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CACHE_HIT: ${{ steps.push-cache.outputs.cache-hit }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] || [ "$CACHE_HIT" != "true" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "This Beijing push slot was already delivered; skipping duplicate."
+          fi
       - name: Set up Python 3.10
-        uses: actions/setup-python@v5
+        if: steps.decision.outputs.run == 'true'
+        uses: actions/setup-python@v6
         with:
           python-version: '3.10'
       - name: Install dependencies
+        if: steps.decision.outputs.run == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       - name: Run ETF Strategy Script
+        if: steps.decision.outputs.run == 'true'
         env:
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
           TOTAL_CAPITAL: ${{ vars.TOTAL_CAPITAL }}
           BUY_MIN: ${{ vars.BUY_MIN }}
           BUY_MAX: ${{ vars.BUY_MAX }}
-        run: python etf_workbench.py
+        run: |
+          set -o pipefail
+          python etf_workbench.py | tee strategy.log
+          grep -Fq "Server酱推送完成。" strategy.log
+      - name: Mark this push slot as delivered
+        if: steps.decision.outputs.run == 'true'
+        run: |
+          mkdir -p .push-state
+          date -u +%FT%TZ > .push-state/delivered-at.txt
+      - name: Save delivered push slot
+        if: steps.decision.outputs.run == 'true' && steps.push-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: .push-state
+          key: ${{ steps.slot.outputs.key }}
       - name: Commit dashboard update
+        if: steps.decision.outputs.run == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -47,6 +96,7 @@ jobs:
             git push
           fi
       - name: Publish public dashboard
+        if: steps.decision.outputs.run == 'true'
         env:
           DASHBOARD_DEPLOY_KEY: ${{ secrets.DASHBOARD_DEPLOY_KEY }}
         run: |
