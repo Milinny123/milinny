@@ -25,6 +25,7 @@ MAX_REPORT_ITEMS = 12
 MAX_DRAWDOWN_LIMIT = -8.0
 MAX_DATA_AGE_DAYS = 10
 MAX_EXCHANGE_ROUND_TRIP_COST_PCT = 1.0
+MIN_INTRADAY_TURNOVER = 50_000_000
 
 
 def _positive_int_env(name: str, default: int) -> int:
@@ -53,7 +54,23 @@ BUY_MAX = max(BUY_MIN, _positive_int_env("BUY_MAX", 250))
 STANDARD_BUY = min(BUY_MAX, max(BUY_MIN, _round_to_50(TOTAL_CAPITAL * 0.10)))
 HIGH_CONVICTION_BUY = min(BUY_MAX, max(BUY_MIN, _round_to_50(TOTAL_CAPITAL * 0.125)))
 BROKER_MIN_COMMISSION = _non_negative_float_env("BROKER_MIN_COMMISSION", 10.0)
+INTRADAY_MAX_ROUND_TRIP_COST_PCT = _non_negative_float_env(
+    "INTRADAY_MAX_ROUND_TRIP_COST_PCT", 1.0
+)
 BENCHMARK = {"code": "510300", "name": "沪深300ETF", "kind": "benchmark", "data_codes": ("510300",)}
+
+# 仅纳入已明确属于债券、黄金或跨境类别的代表性 ETF。普通股票 ETF 为 T+1，
+# 不能因为名称相似而自动推断为可日内回转品种。
+T0_ETF_ALLOWLIST: dict[str, dict[str, str]] = {
+    "511010": {"name": "国债ETF", "category": "债券ETF"},
+    "518880": {"name": "黄金ETF", "category": "黄金ETF"},
+    "513050": {"name": "中概互联网ETF", "category": "跨境ETF"},
+    "513180": {"name": "恒生科技指数ETF", "category": "跨境ETF"},
+    "513330": {"name": "恒生互联网ETF", "category": "跨境ETF"},
+    "159920": {"name": "恒生ETF", "category": "跨境ETF"},
+}
+
+_ETF_SPOT_CACHE: pd.DataFrame | None = None
 
 # 场外基金代码已按基金管理人官网/产品资料核验；代码与名称不得分离修改。
 CORE_WATCHLIST: list[dict[str, Any]] = [
@@ -182,11 +199,19 @@ def _spot_column(frame: pd.DataFrame, names: tuple[str, ...]) -> str | None:
     return _first_existing(frame, names)
 
 
+def _etf_spot() -> pd.DataFrame:
+    global _ETF_SPOT_CACHE
+    if _ETF_SPOT_CACHE is None:
+        frame = ak.fund_etf_spot_em()
+        if frame is None or frame.empty:
+            raise ValueError("全市场 ETF 实时行情为空")
+        _ETF_SPOT_CACHE = frame
+    return _ETF_SPOT_CACHE.copy()
+
+
 def scan_market_etfs() -> list[dict[str, Any]]:
     """Scan liquid full-market ETFs, then leave 20/60-day ranking to historical analysis."""
-    frame = ak.fund_etf_spot_em()
-    if frame is None or frame.empty:
-        return []
+    frame = _etf_spot()
     code_col = _spot_column(frame, ("代码", "基金代码", "code"))
     name_col = _spot_column(frame, ("名称", "基金简称", "name"))
     change_col = _spot_column(frame, ("涨跌幅", "日涨跌幅", "change"))
@@ -219,6 +244,82 @@ def scan_market_etfs() -> list[dict[str, Any]]:
         {"code": row["_code"], "name": row["_name"], "kind": "etf", "data_codes": (row["_code"],), "dynamic": True}
         for _, row in liquid.iterrows()
     ]
+
+
+def scan_intraday_t0(failures: list[str]) -> list[dict[str, Any]]:
+    """Assess representative T+0 ETFs without treating feasibility as a profit forecast."""
+    try:
+        frame = _etf_spot()
+        code_col = _spot_column(frame, ("代码", "基金代码", "code"))
+        name_col = _spot_column(frame, ("名称", "基金简称", "name"))
+        price_col = _spot_column(frame, ("最新价", "现价", "价格", "price"))
+        change_col = _spot_column(frame, ("涨跌幅", "日涨跌幅", "change"))
+        amount_col = _spot_column(frame, ("成交额", "成交金额", "amount"))
+        if not code_col or not name_col or not price_col or not amount_col:
+            raise ValueError(f"日内扫描缺少必要列: {list(frame.columns)}")
+
+        work = frame.copy()
+        work["_code"] = work[code_col].astype(str).str.extract(r"(\d{6})", expand=False)
+        work["_price"] = pd.to_numeric(
+            work[price_col].astype(str).str.replace(",", "", regex=False), errors="coerce"
+        )
+        work["_amount"] = pd.to_numeric(
+            work[amount_col].astype(str).str.replace(",", "", regex=False), errors="coerce"
+        ).fillna(0)
+        if change_col:
+            work["_change"] = pd.to_numeric(
+                work[change_col].astype(str).str.replace("%", "", regex=False).str.replace(",", "", regex=False),
+                errors="coerce",
+            ).fillna(0)
+        else:
+            work["_change"] = 0.0
+
+        candidates: list[dict[str, Any]] = []
+        for code, configured in T0_ETF_ALLOWLIST.items():
+            matches = work[work["_code"] == code]
+            if matches.empty:
+                continue
+            row = matches.iloc[0]
+            price = float(row["_price"])
+            if not math.isfinite(price) or price <= 0:
+                continue
+            lot_cost = price * 100
+            affordable_lots = math.floor(TOTAL_CAPITAL / lot_cost)
+            trade_value = affordable_lots * lot_cost
+            round_trip_cost = BROKER_MIN_COMMISSION * 2
+            cost_pct = round_trip_cost / trade_value * 100 if trade_value else math.inf
+            liquid = float(row["_amount"]) >= MIN_INTRADAY_TURNOVER
+            executable = (
+                affordable_lots >= 1
+                and liquid
+                and cost_pct <= INTRADAY_MAX_ROUND_TRIP_COST_PCT
+            )
+            candidates.append(
+                {
+                    "code": code,
+                    "name": str(row[name_col]) or configured["name"],
+                    "category": configured["category"],
+                    "price": price,
+                    "change": float(row["_change"]),
+                    "turnover": float(row["_amount"]),
+                    "lot_cost": lot_cost,
+                    "affordable_lots": affordable_lots,
+                    "trade_value": trade_value,
+                    "round_trip_cost": round_trip_cost,
+                    "round_trip_cost_pct": cost_pct,
+                    "break_even_move_pct": cost_pct,
+                    "liquid": liquid,
+                    "executable": executable,
+                }
+            )
+        return sorted(
+            candidates,
+            key=lambda item: (item["executable"], item["change"], item["turnover"]),
+            reverse=True,
+        )
+    except Exception as exc:
+        failures.append(f"T+0 日内扫描：{_short_error(exc)}")
+        return []
 
 
 def _fund_catalog() -> pd.DataFrame:
@@ -507,6 +608,7 @@ def analyse_market(now: datetime | None = None) -> dict[str, Any]:
     _rank_results(results)
     enrich_redemption_fees(results, failures)
     results.sort(key=lambda row: row["score"], reverse=True)
+    intraday_t0 = scan_intraday_t0(failures)
     return {
         "now": now,
         "mode": mode,
@@ -516,6 +618,7 @@ def analyse_market(now: datetime | None = None) -> dict[str, Any]:
         "watch_count": len(watchlist),
         "benchmark_returns": benchmark_returns,
         "benchmark_date": benchmark_date,
+        "intraday_t0": intraday_t0,
     }
 
 
@@ -560,6 +663,27 @@ def _line(item: dict[str, Any]) -> str:
     )
 
 
+def _intraday_line(item: dict[str, Any]) -> str:
+    if item["affordable_lots"] < 1:
+        decision = f"资金不足购买 1 手（约 {item['lot_cost']:.0f} 元）"
+    elif not item["liquid"]:
+        decision = "成交额不足 5000 万元，只观察"
+    elif not item["executable"]:
+        decision = (
+            f"佣金占比 {item['round_trip_cost_pct']:.2f}% 超过上限 "
+            f"{INTRADAY_MAX_ROUND_TRIP_COST_PCT:.1f}%，不交易"
+        )
+    else:
+        decision = "成本门槛通过；仍须结合盘中趋势人工确认，不代表必然盈利"
+    return (
+        f"- **{item['code']} {item['name']}**（{item['category']}）：现价 {item['price']:.3f}，"
+        f"当日涨跌 {item['change']:.2f}%，1 手约 {item['lot_cost']:.0f} 元；"
+        f"按最多 {item['affordable_lots']} 手、成交 {item['trade_value']:.0f} 元测算，"
+        f"买卖最低佣金 {item['round_trip_cost']:.0f} 元，至少上涨约 "
+        f"{item['break_even_move_pct']:.2f}% 才覆盖固定佣金（未计价差与滑点）；**{decision}**。"
+    )
+
+
 def build_report(context: dict[str, Any]) -> tuple[str, str]:
     now: datetime = context["now"]
     mode = context["mode"]
@@ -581,6 +705,20 @@ def build_report(context: dict[str, Any]) -> tuple[str, str]:
     lines.extend(_line(item) for item in c_class_results[:MAX_REPORT_ITEMS])
     lines += ["", "## 场内 ETF 观察榜（已计入最低佣金）"]
     lines.extend(_line(item) for item in exchange_results[:6])
+    intraday = context.get("intraday_t0", [])
+    executable_intraday = [item for item in intraday if item["executable"]]
+    lines += ["", "## T+0 日内盈利可执行性（与支付宝波段分开）"]
+    if executable_intraday:
+        lines.extend(_intraday_line(item) for item in executable_intraday[:3])
+    elif intraday:
+        lines.append(
+            f"- **今日无通过成本门槛的日内标的。** 当前总资金 {TOTAL_CAPITAL} 元、买卖各最低佣金 "
+            f"{BROKER_MIN_COMMISSION:.0f} 元，理论最低固定成本约 "
+            f"{BROKER_MIN_COMMISSION * 2 / TOTAL_CAPITAL * 100:.2f}%；不为了追求当天盈利强行交易。"
+        )
+        lines.extend(_intraday_line(item) for item in intraday[:3])
+    else:
+        lines.append("- 实时行情未返回可核验的 T+0 候选，本次不生成日内信号。")
     if mode == "morning":
         lines += ["", "**早盘焦点：** 优先观察池内分位靠前、同时站上 MA20/MA60 且相对沪深300为正的标的，开盘不追高。"]
     else:
@@ -588,6 +726,7 @@ def build_report(context: dict[str, Any]) -> tuple[str, str]:
     lines += [
         "",
         f"**场内成本过滤：** 按买入、卖出各最低 {BROKER_MIN_COMMISSION:.0f} 元佣金计算；往返成本超过 {MAX_EXCHANGE_ROUND_TRIP_COST_PCT:.1f}% 时只观察、不下单。",
+        "**日内规则：** 仅扫描允许当日回转的代表性债券、黄金和跨境 ETF；普通股票 ETF 不作为日内标的。日内回本涨幅尚未计入买卖价差、滑点和溢价风险。",
         "",
         "**支付宝 C 类风控：** 不同基金赎回费规则不同；脚本会实时核验出现买入信号的基金，必须按报告给出的免赎回费持有期限执行，并以支付宝购买页为最终依据。",
         "",
@@ -623,11 +762,21 @@ def build_dashboard(context: dict[str, Any], title: str) -> str:
         "dynamic_count": context["dynamic_count"],
         "watch_count": context["watch_count"],
         "results": results,
+        "intraday_t0": context.get("intraday_t0", []),
         "failures": context["failures"],
     }
     data_json = json.dumps(payload, ensure_ascii=False, default=str).replace("</", "<\\/")
     rows = "".join(_dashboard_row(item) for item in results)
     failures = "".join(f"<li>{html.escape(failure)}</li>" for failure in context["failures"])
+    intraday = context.get("intraday_t0", [])
+    intraday_rows = "".join(
+        f"<tr><td><strong>{html.escape(item['name'])}</strong><small>{item['code']} · {item['category']}</small></td>"
+        f"<td>{item['price']:.3f}</td><td>{item['change']:.2f}%</td><td>{item['lot_cost']:.0f} 元</td>"
+        f"<td>{item['trade_value']:.0f} 元 / {item['affordable_lots']} 手</td>"
+        f"<td>{item['round_trip_cost_pct']:.2f}%</td>"
+        f"<td class='{'positive' if item['executable'] else 'danger'}'>{'成本门槛通过' if item['executable'] else '不交易'}</td></tr>"
+        for item in intraday
+    )
     return f'''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html.escape(title)} · ETF Workbench</title>
@@ -647,6 +796,8 @@ main {{ max-width:1240px; margin:0 auto; padding:32px 20px 56px; }} header {{ di
 <section class="stats"><div class="stat"><span>有效标的</span><b>{len(results)}</b></div><div class="stat"><span>动态扫描 ETF</span><b>{context['dynamic_count']}</b></div><div class="stat"><span>买入观察</span><b>{sum(item['action'] == '买入观察' for item in results)}</b></div><div class="stat"><span>触发风控</span><b>{sum(item['stop'] for item in results)}</b></div></section>
 <div class="toolbar"><input id="search" type="search" placeholder="搜索名称或代码"><select id="kind"><option value="all">全部标的</option><option value="alipay_c">支付宝 C 类</option><option value="linked_c">自动匹配 C 类</option><option value="etf">场内 ETF</option></select></div>
 <section class="table-panel"><table><thead><tr><th>排名</th><th>标的</th><th>数据日期</th><th>动量得分</th><th>池内分位</th><th>20日收益 / RS</th><th>MA20 / MA60</th><th>20日回撤</th><th>动作与依据</th></tr></thead><tbody id="rows">{rows}</tbody></table></section>
+<section class="notes"><h2>T+0 日内盈利可执行性</h2><p>仅列出规则允许当日回转的代表性债券、黄金和跨境 ETF。成本门槛通过不等于盈利预测；回本涨幅还未计买卖价差、滑点和溢价风险。</p></section>
+<section class="table-panel"><table><thead><tr><th>T+0 标的</th><th>现价</th><th>当日涨跌</th><th>1 手金额</th><th>最多成交</th><th>佣金回本涨幅</th><th>结论</th></tr></thead><tbody>{intraday_rows or '<tr><td colspan="7">本次未获取到可核验的 T+0 行情。</td></tr>'}</tbody></table></section>
 <section class="notes"><h2>风控与数据状态</h2><p>总资金 {TOTAL_CAPITAL} 元，单笔加仓控制在 {BUY_MIN}～{BUY_MAX} 元。场内 ETF 按买卖各最低 {BROKER_MIN_COMMISSION:.0f} 元佣金过滤，往返成本超过 {MAX_EXCHANGE_ROUND_TRIP_COST_PCT:.1f}% 时只观察；支付宝 C 类按实时赎回费率给出最低计划持有天数，最终以购买页为准。</p>{f'<ul>{failures}</ul>' if failures else '<p>本次扫描未记录接口失败。</p>'}</section>
 <script type="application/json" id="dashboard-data">{data_json}</script><script>
 const data=JSON.parse(document.getElementById('dashboard-data').textContent); const search=document.getElementById('search'); const kind=document.getElementById('kind');
