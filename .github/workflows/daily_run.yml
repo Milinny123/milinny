@@ -2,11 +2,16 @@ name: Daily ETF & Fund Momentum Screener
 
 on:
   schedule:
-    # Redundant trigger windows; a daily cache lock prevents duplicate pushes.
-    - cron: '45,55 0 * * 1-5'
-    - cron: '5 1 * * 1-5'
-    - cron: '10,20,30 6 * * 1-5'
+    # Fallback windows after the independent 09:00/14:20 dispatcher.
+    - cron: '5,15,25 1 * * 1-5'
+    - cron: '25,35,45 6 * * 1-5'
   workflow_dispatch:
+    inputs:
+      force_push:
+        description: 'Ignore the slot lock and send again'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -42,10 +47,10 @@ jobs:
       - name: Decide whether to run
         id: decision
         env:
-          EVENT_NAME: ${{ github.event_name }}
           CACHE_HIT: ${{ steps.push-cache.outputs.cache-hit }}
+          FORCE_PUSH: ${{ inputs.force_push }}
         run: |
-          if [ "$EVENT_NAME" = "workflow_dispatch" ] || [ "$CACHE_HIT" != "true" ]; then
+          if [ "$FORCE_PUSH" = "true" ] || [ "$CACHE_HIT" != "true" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
