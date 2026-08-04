@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import signal
 from datetime import datetime, time, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -115,6 +116,28 @@ def _short_error(exc: Exception, limit: int = 180) -> str:
     return text if len(text) <= limit else f"{text[:limit - 3]}..."
 
 
+class _AkshareTimeout(TimeoutError):
+    """Raised when an external AkShare request exceeds the per-call limit."""
+
+
+def _ak_call(func: Callable[[], Any], seconds: int = 20) -> Any:
+    """Run one network-backed AkShare call with a hard timeout on Linux runners."""
+    if not hasattr(signal, "SIGALRM"):
+        return func()
+    previous = signal.getsignal(signal.SIGALRM)
+
+    def alarm_handler(_signum: int, _frame: Any) -> None:
+        raise _AkshareTimeout(f"AkShare 请求超过 {seconds} 秒")
+
+    signal.signal(signal.SIGALRM, alarm_handler)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        return func()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 def _normalise_history(frame: Any) -> pd.DataFrame:
     if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
         raise ValueError("接口返回空数据")
@@ -179,7 +202,7 @@ def fetch_history(code: str, kind: str) -> tuple[pd.DataFrame, str, str]:
     errors: list[str] = []
     for attempt in _history_attempts(code, kind):
         try:
-            return _normalise_history(attempt()), code, "akshare"
+            return _normalise_history(_ak_call(attempt)), code, "akshare"
         except Exception as exc:
             errors.append(_short_error(exc))
     raise RuntimeError("；".join(errors))
@@ -202,7 +225,7 @@ def _spot_column(frame: pd.DataFrame, names: tuple[str, ...]) -> str | None:
 def _etf_spot() -> pd.DataFrame:
     global _ETF_SPOT_CACHE
     if _ETF_SPOT_CACHE is None:
-        frame = ak.fund_etf_spot_em()
+        frame = _ak_call(ak.fund_etf_spot_em)
         if frame is None or frame.empty:
             raise ValueError("全市场 ETF 实时行情为空")
         _ETF_SPOT_CACHE = frame
@@ -330,7 +353,7 @@ def _fund_catalog() -> pd.DataFrame:
     errors: list[str] = []
     for attempt in attempts:
         try:
-            frame = attempt()
+            frame = _ak_call(attempt)
             if frame is None or frame.empty:
                 raise ValueError("基金目录为空")
             code_col = _first_existing(frame, ("基金代码", "代码", "fund_code"))
@@ -562,7 +585,7 @@ def enrich_redemption_fees(results: list[dict[str, Any]], failures: list[str]) -
         if item["kind"] not in {"alipay_c", "linked_c"} or item["action"] != "买入观察":
             continue
         try:
-            fee_frame = ak.fund_fee_em(symbol=item["code"], indicator="赎回费率")
+            fee_frame = _ak_call(lambda: ak.fund_fee_em(symbol=item["code"], indicator="赎回费率"))
             summary, fee_free_days = _redemption_fee_summary(fee_frame)
             item["fee_verified"] = True
             item["redemption_fee_summary"] = summary
