@@ -617,6 +617,7 @@ def _rank_results(results: list[dict[str, Any]]) -> None:
             and item["rs20"] > 0
             and item["rs_score"] > 0
             and (RISK_PROFILE != "aggressive" or item["high_move_capable"])
+            and (RISK_PROFILE != "aggressive" or item["r1"] >= TARGET_DAILY_MOVE)
         ):
             proposed_amount = (
                 HIGH_CONVICTION_BUY
@@ -902,7 +903,11 @@ def build_report(context: dict[str, Any]) -> tuple[str, str]:
     alipay_results = [item for item in results if _is_alipay_fund(item["kind"])]
     exchange_results = [item for item in results if item["kind"] == "etf"]
     high_move_results = sorted(
-        (item for item in results if item["high_move_capable"] and not item["stale"]),
+        (
+            item
+            for item in results
+            if item["r1"] >= TARGET_DAILY_MOVE and item["high_move_capable"] and not item["stale"]
+        ),
         key=lambda item: (item["r1"], item["max_daily_gain20"], item["score"]),
         reverse=True,
     )
@@ -930,7 +935,7 @@ def build_report(context: dict[str, Any]) -> tuple[str, str]:
     if high_move_results:
         lines.extend(_line(item) for item in high_move_results[:6])
     else:
-        lines.append(f"- 今日无通过趋势与数据检查的 {TARGET_DAILY_MOVE:.1f}% 高波动候选，不强行交易。")
+        lines.append(f"- 今日无最新1日涨幅达到 {TARGET_DAILY_MOVE:.1f}% 且通过趋势检查的候选，不强行交易。")
     lines += [
         "",
         "## 支付宝场外基金优先榜",
