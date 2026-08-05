@@ -62,6 +62,7 @@ BROKER_MIN_COMMISSION = _non_negative_float_env("BROKER_MIN_COMMISSION", 10.0)
 INTRADAY_MAX_ROUND_TRIP_COST_PCT = _non_negative_float_env(
     "INTRADAY_MAX_ROUND_TRIP_COST_PCT", 1.0
 )
+TARGET_DAILY_MOVE = _non_negative_float_env("TARGET_DAILY_MOVE", 3.0)
 MOMENTUM_WEIGHTS = (0.65, 0.25, 0.10) if RISK_PROFILE == "aggressive" else (0.50, 0.30, 0.20)
 SIGNAL_PERCENTILE = 80 if RISK_PROFILE == "aggressive" else 70
 SIGNAL_MIN_SCORE = 1.5 if RISK_PROFILE == "aggressive" else 0.0
@@ -541,7 +542,11 @@ def analyse_item(
     if len(history) < 61:
         raise ValueError(f"有效数据 {len(history)} 条，少于 61 条")
     close = history["close"]
-    returns = {days: _return(close, days) for days in (5, 20, 60)}
+    returns = {days: _return(close, days) for days in (1, 5, 20, 60)}
+    daily_returns = close.pct_change().dropna().tail(20) * 100
+    max_daily_gain20 = float(daily_returns.max())
+    daily_volatility20 = float(daily_returns.std(ddof=0))
+    target_move_days20 = int((daily_returns >= TARGET_DAILY_MOVE).sum())
     latest = float(close.iloc[-1])
     ma20 = float(close.tail(20).mean())
     ma60 = float(close.tail(60).mean())
@@ -564,6 +569,7 @@ def analyse_item(
         "data_age_days": data_age_days,
         "stale": data_age_days > MAX_DATA_AGE_DAYS,
         "latest": latest,
+        "r1": returns[1],
         "r5": returns[5],
         "r20": returns[20],
         "r60": returns[60],
@@ -577,6 +583,10 @@ def analyse_item(
         "rs20": rs20,
         "rs60": rs60,
         "rs_score": rs20 * 0.6 + rs60 * 0.4,
+        "max_daily_gain20": max_daily_gain20,
+        "daily_volatility20": daily_volatility20,
+        "target_move_days20": target_move_days20,
+        "high_move_capable": max_daily_gain20 >= TARGET_DAILY_MOVE,
         "benchmark_verified": bool(benchmark_returns),
     }
 
@@ -606,6 +616,7 @@ def _rank_results(results: list[dict[str, Any]]) -> None:
             and item["pool_percentile"] >= SIGNAL_PERCENTILE
             and item["rs20"] > 0
             and item["rs_score"] > 0
+            and (RISK_PROFILE != "aggressive" or item["high_move_capable"])
         ):
             proposed_amount = (
                 HIGH_CONVICTION_BUY
@@ -833,8 +844,10 @@ def _action_text(item: dict[str, Any]) -> str:
 def _line(item: dict[str, Any]) -> str:
     trend = f"MA20 {'上方' if item['above_ma20'] else '下方'} / MA60 {'上方' if item['above_ma60'] else '下方'}"
     return (
-        f"- **{item['code']} {item['name']}**（{item['kind']}）：5/20/60日 "
-        f"{item['r5']:.2f}% / {item['r20']:.2f}% / {item['r60']:.2f}%，动量 **{item['score']:.2f}**，"
+        f"- **{item['code']} {item['name']}**（{item['kind']}）：1/5/20/60日 "
+        f"{item['r1']:.2f}% / {item['r5']:.2f}% / {item['r20']:.2f}% / {item['r60']:.2f}%，"
+        f"近20日最大单日上涨 **{item['max_daily_gain20']:.2f}%**（≥{TARGET_DAILY_MOVE:.1f}% 共 {item['target_move_days20']} 次），"
+        f"日波动率 {item['daily_volatility20']:.2f}%，动量 **{item['score']:.2f}**，"
         f"池内分位 **{item['pool_percentile']:.1f}%**（约前 {item['pool_top_percent']}%）；"
         f"数据日期 {item['data_date']}，{trend}，相对沪深300超额20/60日 {item['rs20']:.2f}% / {item['rs60']:.2f}%，"
         f"回撤 {item['drawdown']:.2f}%，**{_action_text(item)}**。"
@@ -850,7 +863,7 @@ def _holding_line(position: dict[str, Any]) -> str:
         else "，截图未含成交净值，暂不计算盈亏"
     )
     signal = (
-        f"；动量 {item['score']:.2f}，MA20 {'上方' if item['above_ma20'] else '下方'}，"
+        f"；最新1日 {item['r1']:.2f}%，动量 {item['score']:.2f}，MA20 {'上方' if item['above_ma20'] else '下方'}，"
         f"20日回撤 {item['drawdown']:.2f}%"
         if item
         else "；本次行情获取失败"
@@ -888,6 +901,11 @@ def build_report(context: dict[str, Any]) -> tuple[str, str]:
     results = context["results"]
     alipay_results = [item for item in results if _is_alipay_fund(item["kind"])]
     exchange_results = [item for item in results if item["kind"] == "etf"]
+    high_move_results = sorted(
+        (item for item in results if item["high_move_capable"] and not item["stale"]),
+        key=lambda item: (item["r1"], item["max_daily_gain20"], item["score"]),
+        reverse=True,
+    )
     title = "早盘全市场风向与动量预选" if mode == "morning" else "支付宝 14:30 实操买卖指南"
     benchmark = context["benchmark_returns"]
     lines = [
@@ -906,6 +924,14 @@ def build_report(context: dict[str, Any]) -> tuple[str, str]:
         "",
         "## 沪深300基准",
         f"数据日期：{context['benchmark_date'] or '未获取'}；5/20/60日：{benchmark.get(5, 0):.2f}% / {benchmark.get(20, 0):.2f}% / {benchmark.get(60, 0):.2f}%",
+        "",
+        f"## {TARGET_DAILY_MOVE:.1f}%+ 高波动进攻候选",
+    ]
+    if high_move_results:
+        lines.extend(_line(item) for item in high_move_results[:6])
+    else:
+        lines.append(f"- 今日无通过趋势与数据检查的 {TARGET_DAILY_MOVE:.1f}% 高波动候选，不强行交易。")
+    lines += [
         "",
         "## 支付宝场外基金优先榜",
     ]
@@ -939,6 +965,7 @@ def build_report(context: dict[str, Any]) -> tuple[str, str]:
         "**支付宝 C 类风控：** 不同基金赎回费规则不同；脚本会实时核验出现买入信号的基金，必须按报告给出的免赎回费持有期限执行，并以支付宝购买页为最终依据。",
         "",
         f"**风险提示：** 当前为{'进攻' if RISK_PROFILE == 'aggressive' else '均衡'}档，短期收益权重为 {MOMENTUM_WEIGHTS[0]:.0%}，可能带来更大回撤；不代表收益预测。",
+        f"**3%目标说明：** 仅表示近20个交易日曾出现单日上涨 ≥{TARGET_DAILY_MOVE:.1f}%，不代表下一交易日或每天都能上涨 {TARGET_DAILY_MOVE:.1f}%。",
         "**免责声明：** 本报告由量化脚本自动生成，仅供研究参考，不构成投资建议。",
     ]
     if context["failures"]:
@@ -958,6 +985,7 @@ def _dashboard_row(item: dict[str, Any]) -> str:
         f"<tr data-kind='{html.escape(item['kind'])}'><td>{item['rank']}</td>"
         f"<td><strong>{html.escape(item['name'])}</strong><small>{html.escape(item['code'])} · {kind_label}</small></td>"
         f"<td>{html.escape(item['data_date'])}</td>"
+        f"<td>{item['r1']:.2f}%</td><td>{item['max_daily_gain20']:.2f}%<small>达标 {item['target_move_days20']} 次</small></td>"
         f"<td>{item['score']:.2f}</td><td>{item['pool_percentile']:.1f}%</td>"
         f"<td>{item['r20']:.2f}%<br><small>RS {item['rs20']:.2f}%</small></td>"
         f"<td>{'是' if item['above_ma20'] else '否'} / {'是' if item['above_ma60'] else '否'}</td>"
@@ -973,7 +1001,10 @@ def _dashboard_holding_row(position: dict[str, Any]) -> str:
     latest = "--"
     drawdown = "--"
     if item:
-        trend = f"MA20 {'上方' if item['above_ma20'] else '下方'} / MA60 {'上方' if item['above_ma60'] else '下方'}"
+        trend = (
+            f"1日 {item['r1']:.2f}% · MA20 {'上方' if item['above_ma20'] else '下方'} / "
+            f"MA60 {'上方' if item['above_ma60'] else '下方'}"
+        )
         latest = f"{item['latest']:.4f}"
         drawdown = f"{item['drawdown']:.2f}%"
     current_return = position.get("current_return")
@@ -1037,9 +1068,9 @@ main {{ max-width:1240px; margin:0 auto; padding:32px 20px 56px; }} header {{ di
 <section class="stats"><div class="stat"><span>当前持仓</span><b>{len(holdings)}</b></div><div class="stat"><span>已投入</span><b>{context.get('invested_amount', 0):.0f}</b></div><div class="stat"><span>剩余资金</span><b>{context.get('remaining_cash', TOTAL_CAPITAL):.0f}</b></div><div class="stat"><span>有效标的</span><b>{len(results)}</b></div><div class="stat"><span>触发风控</span><b>{sum(item['stop'] for item in results)}</b></div></section>
 <section class="notes"><h2>我的持仓与最新操作建议</h2><p>操作建议依据最新可用净值、均线、动量、回撤和赎回费期限生成；待确认订单不重复加仓。</p></section>
 <section class="table-panel"><table><thead><tr><th>持有基金</th><th>买入时间</th><th>金额</th><th>状态</th><th>最新净值</th><th>趋势</th><th>20日回撤</th><th>持仓收益</th><th>当前操作</th></tr></thead><tbody>{holding_rows or '<tr><td colspan="9">尚未录入持仓。</td></tr>'}</tbody></table></section>
-<section class="notes"><h2>全市场最新候选与交易操作</h2><p>进攻档优先展示短期动量和相对强度靠前的标的；候选榜不等同于必须买入。</p></section>
+<section class="notes"><h2>{TARGET_DAILY_MOVE:.1f}%+ 高波动候选与交易操作</h2><p>仅将近 20 个交易日曾出现单日上涨 ≥{TARGET_DAILY_MOVE:.1f}% 的标的纳入进攻买入候选；历史高波动不代表未来每天上涨。</p></section>
 <div class="toolbar"><input id="search" type="search" placeholder="搜索名称或代码"><select id="kind"><option value="all">全部标的</option><option value="alipay_a">支付宝 A 类</option><option value="alipay_c">支付宝 C 类</option><option value="linked_c">自动匹配 C 类</option><option value="etf">场内 ETF</option></select></div>
-<section class="table-panel"><table><thead><tr><th>排名</th><th>标的</th><th>数据日期</th><th>动量得分</th><th>池内分位</th><th>20日收益 / RS</th><th>MA20 / MA60</th><th>20日回撤</th><th>动作与依据</th></tr></thead><tbody id="rows">{rows}</tbody></table></section>
+<section class="table-panel"><table><thead><tr><th>排名</th><th>标的</th><th>数据日期</th><th>最新1日</th><th>20日最大单日涨幅</th><th>动量得分</th><th>池内分位</th><th>20日收益 / RS</th><th>MA20 / MA60</th><th>20日回撤</th><th>动作与依据</th></tr></thead><tbody id="rows">{rows}</tbody></table></section>
 <section class="notes"><h2>T+0 日内盈利可执行性</h2><p>仅列出规则允许当日回转的代表性债券、黄金和跨境 ETF。成本门槛通过不等于盈利预测；回本涨幅还未计买卖价差、滑点和溢价风险。</p></section>
 <section class="table-panel"><table><thead><tr><th>T+0 标的</th><th>现价</th><th>当日涨跌</th><th>1 手金额</th><th>最多成交</th><th>佣金回本涨幅</th><th>结论</th></tr></thead><tbody>{intraday_rows or '<tr><td colspan="7">本次未获取到可核验的 T+0 行情。</td></tr>'}</tbody></table></section>
 <section class="notes"><h2>风控与数据状态</h2><p>总资金 {TOTAL_CAPITAL} 元，单笔加仓控制在 {BUY_MIN}～{BUY_MAX} 元。场内 ETF 按买卖各最低 {BROKER_MIN_COMMISSION:.0f} 元佣金过滤，往返成本超过 {MAX_EXCHANGE_ROUND_TRIP_COST_PCT:.1f}% 时只观察；支付宝 C 类按实时赎回费率给出最低计划持有天数，最终以购买页为准。</p>{f'<ul>{failures}</ul>' if failures else '<p>本次扫描未记录接口失败。</p>'}</section>
