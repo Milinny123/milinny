@@ -20,7 +20,10 @@ import requests
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 HISTORY_ROWS = 150
-MAX_DYNAMIC_CANDIDATES = 12
+RISK_PROFILE = os.getenv("RISK_PROFILE", "aggressive").strip().lower()
+if RISK_PROFILE not in {"balanced", "aggressive"}:
+    RISK_PROFILE = "aggressive"
+MAX_DYNAMIC_CANDIDATES = 24 if RISK_PROFILE == "aggressive" else 12
 MAX_LINKED_FUNDS = 10
 MAX_REPORT_ITEMS = 12
 MAX_DRAWDOWN_LIMIT = -8.0
@@ -59,6 +62,10 @@ BROKER_MIN_COMMISSION = _non_negative_float_env("BROKER_MIN_COMMISSION", 10.0)
 INTRADAY_MAX_ROUND_TRIP_COST_PCT = _non_negative_float_env(
     "INTRADAY_MAX_ROUND_TRIP_COST_PCT", 1.0
 )
+MOMENTUM_WEIGHTS = (0.65, 0.25, 0.10) if RISK_PROFILE == "aggressive" else (0.50, 0.30, 0.20)
+SIGNAL_PERCENTILE = 80 if RISK_PROFILE == "aggressive" else 70
+SIGNAL_MIN_SCORE = 1.5 if RISK_PROFILE == "aggressive" else 0.0
+REQUIRE_MA60 = RISK_PROFILE != "aggressive"
 BENCHMARK = {"code": "510300", "name": "沪深300ETF", "kind": "benchmark", "data_codes": ("510300",)}
 
 # 仅纳入已明确属于债券、黄金或跨境类别的代表性 ETF。普通股票 ETF 为 T+1，
@@ -542,7 +549,11 @@ def analyse_item(
     drawdown = (latest / high20 - 1) * 100
     data_date = history["date"].iloc[-1].date()
     data_age_days = (as_of.astimezone(BEIJING_TZ).date() - data_date).days
-    score = returns[5] * 0.5 + returns[20] * 0.3 + returns[60] * 0.2
+    score = (
+        returns[5] * MOMENTUM_WEIGHTS[0]
+        + returns[20] * MOMENTUM_WEIGHTS[1]
+        + returns[60] * MOMENTUM_WEIGHTS[2]
+    )
     rs20 = returns[20] - benchmark_returns.get(20, 0.0)
     rs60 = returns[60] - benchmark_returns.get(60, 0.0)
     return {
@@ -589,10 +600,10 @@ def _rank_results(results: list[dict[str, Any]]) -> None:
             item["action"] = "风控止损"
             item["amount"] = 0
         elif (
-            item["score"] > 0
+            item["score"] >= SIGNAL_MIN_SCORE
             and item["above_ma20"]
-            and item["above_ma60"]
-            and item["pool_percentile"] >= 70
+            and (item["above_ma60"] or not REQUIRE_MA60)
+            and item["pool_percentile"] >= SIGNAL_PERCENTILE
             and item["rs20"] > 0
             and item["rs_score"] > 0
         ):
@@ -882,7 +893,7 @@ def build_report(context: dict[str, Any]) -> tuple[str, str]:
     lines = [
         f"# {title}",
         f"更新时间：{now:%Y-%m-%d %H:%M}（北京时间）",
-        f"扫描 {context['watch_count']} 个候选（动态 ETF {context['dynamic_count']} 个），有效分析 {len(results)} 个。",
+        f"风险档位：{'进攻' if RISK_PROFILE == 'aggressive' else '均衡'}；扫描 {context['watch_count']} 个候选（动态 ETF {context['dynamic_count']} 个），有效分析 {len(results)} 个。",
         "",
         "## 我的持仓复盘（仅微信报告显示明细）",
         f"已投入 {context['invested_amount']:.0f} 元 / 总资金 {TOTAL_CAPITAL} 元；剩余可用资金 {context['remaining_cash']:.0f} 元。",
@@ -916,7 +927,8 @@ def build_report(context: dict[str, Any]) -> tuple[str, str]:
     else:
         lines.append("- 实时行情未返回可核验的 T+0 候选，本次不生成日内信号。")
     if mode == "morning":
-        lines += ["", "**早盘焦点：** 优先观察池内分位靠前、同时站上 MA20/MA60 且相对沪深300为正的标的，开盘不追高。"]
+        trend_rule = "站上 MA20 且短期动量强" if RISK_PROFILE == "aggressive" else "同时站上 MA20/MA60"
+        lines += ["", f"**早盘焦点：** 进攻档优先观察池内分位靠前、{trend_rule} 且相对沪深300为正的标的，开盘不追高。"]
     else:
         lines += ["", f"**尾盘纪律：** 单笔加仓严格控制在 {BUY_MIN}～{BUY_MAX} 元，{TOTAL_CAPITAL} 元总资金分批操作，不因单日波动满仓。"]
     lines += [
@@ -926,6 +938,7 @@ def build_report(context: dict[str, Any]) -> tuple[str, str]:
         "",
         "**支付宝 C 类风控：** 不同基金赎回费规则不同；脚本会实时核验出现买入信号的基金，必须按报告给出的免赎回费持有期限执行，并以支付宝购买页为最终依据。",
         "",
+        f"**风险提示：** 当前为{'进攻' if RISK_PROFILE == 'aggressive' else '均衡'}档，短期收益权重为 {MOMENTUM_WEIGHTS[0]:.0%}，可能带来更大回撤；不代表收益预测。",
         "**免责声明：** 本报告由量化脚本自动生成，仅供研究参考，不构成投资建议。",
     ]
     if context["failures"]:
