@@ -110,6 +110,16 @@ CORE_WATCHLIST: list[dict[str, Any]] = [
     {"code": "516150", "name": "稀土ETF嘉实", "kind": "etf", "data_codes": ("516150",)},
 ]
 
+METALS_CODES = {
+    "004433",
+    "017193",
+    "018168",
+    "011036",
+    "512400",
+    "159876",
+    "516150",
+}
+
 
 def _is_alipay_fund(kind: str) -> bool:
     return kind in {"alipay_a", "alipay_c", "linked_c"}
@@ -1057,6 +1067,20 @@ def _dashboard_holding_row(position: dict[str, Any]) -> str:
     )
 
 
+def _dashboard_metals_row(item: dict[str, Any]) -> str:
+    kind_label = "支付宝场外" if _is_alipay_fund(item["kind"]) else "场内 ETF"
+    action_class = "danger" if item["stop"] else ("positive" if item["action"] == "买入观察" else "neutral")
+    return (
+        "<tr>"
+        f"<td><strong>{html.escape(item['name'])}</strong><small>{html.escape(item['code'])} · {kind_label}</small></td>"
+        f"<td>{html.escape(item['data_date'])}</td>"
+        f"<td>{item['r1']:.2f}%</td><td>{item['r3']:.2f}%</td><td>{item['r5']:.2f}%</td>"
+        f"<td>{item['short_score']:.2f}</td>"
+        f"<td>{'上方' if item['above_ma20'] else '下方'} / {'上方' if item['above_ma60'] else '下方'}</td>"
+        f"<td class='{action_class}'>{html.escape(_action_text(item))}</td></tr>"
+    )
+
+
 def build_dashboard(context: dict[str, Any], title: str) -> str:
     now: datetime = context["now"]
     results = context["results"]
@@ -1075,6 +1099,12 @@ def build_dashboard(context: dict[str, Any], title: str) -> str:
     }
     data_json = json.dumps(payload, ensure_ascii=False, default=str).replace("</", "<\\/")
     rows = "".join(_dashboard_row(item) for item in results)
+    metals = sorted(
+        (item for item in results if item["code"] in METALS_CODES),
+        key=lambda item: item["short_score"],
+        reverse=True,
+    )
+    metals_rows = "".join(_dashboard_metals_row(item) for item in metals)
     failures = "".join(f"<li>{html.escape(failure)}</li>" for failure in context["failures"])
     intraday = context.get("intraday_t0", [])
     holdings = context.get("holdings", [])
@@ -1097,15 +1127,18 @@ main {{ max-width:1240px; margin:0 auto; padding:32px 20px 56px; }} header {{ di
 .eyebrow {{ color:var(--blue); font-size:12px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }} h1 {{ margin:5px 0 4px; font-size:clamp(26px,4vw,42px); line-height:1.15; }} p {{ margin:0; color:var(--muted); }}
 .stamp {{ color:var(--muted); text-align:right; white-space:nowrap; }} .stats {{ display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:12px; margin-bottom:22px; }}
 .stat, .table-panel, .notes {{ background:var(--panel); border:1px solid var(--line); border-radius:8px; }} .stat {{ padding:16px; }} .stat b {{ display:block; font-size:25px; }} .stat span {{ color:var(--muted); font-size:13px; }}
+.metals-heading {{ border-left:4px solid #b7791f; background:#fffaf0; }} .metals-heading h2 {{ color:#8a5a00; }}
 .toolbar {{ display:flex; gap:10px; margin:14px 0; }} input, select {{ border:1px solid var(--line); background:#fff; border-radius:6px; padding:10px 12px; color:var(--ink); }} input {{ flex:1; min-width:160px; }}
 .table-panel {{ overflow:auto; }} table {{ width:100%; border-collapse:collapse; min-width:930px; }} th,td {{ padding:12px 13px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} th {{ background:#f8fafb; color:var(--muted); font-size:12px; white-space:nowrap; }} td small {{ display:block; color:var(--muted); }} tr:last-child td {{ border-bottom:0; }}
 .positive {{ color:var(--green); font-weight:700; }} .danger {{ color:var(--red); font-weight:700; }} .neutral {{ color:#8a5a00; }} .notes {{ padding:16px; margin-top:16px; }} .notes h2 {{ font-size:16px; margin:0 0 8px; }} .notes ul {{ margin:8px 0 0; padding-left:20px; color:var(--muted); }}
 @media (max-width:700px) {{ main {{ padding:22px 12px 40px; }} header {{ display:block; }} .stamp {{ text-align:left; margin-top:10px; }} .stats {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .toolbar {{ flex-direction:column; }} }}
 </style></head><body><main>
 <header><div><div class="eyebrow">ETF WORKBENCH · {TOTAL_CAPITAL} CNY MODE</div><h1>{html.escape(title)}</h1><p>全市场动量、相对沪深300强弱与风险回撤的可视化筛选。</p></div><div class="stamp">更新时间<br><strong>{now:%Y-%m-%d %H:%M} 北京时间</strong></div></header>
-<section class="stats"><div class="stat"><span>当前持仓</span><b>{len(holdings)}</b></div><div class="stat"><span>已投入</span><b>{context.get('invested_amount', 0):.0f}</b></div><div class="stat"><span>剩余资金</span><b>{context.get('remaining_cash', TOTAL_CAPITAL):.0f}</b></div><div class="stat"><span>有效标的</span><b>{len(results)}</b></div><div class="stat"><span>触发风控</span><b>{sum(item['stop'] for item in results)}</b></div></section>
+<section class="stats"><div class="stat"><span>当前持仓</span><b>{len(holdings)}</b></div><div class="stat"><span>已投入</span><b>{context.get('invested_amount', 0):.0f}</b></div><div class="stat"><span>剩余资金</span><b>{context.get('remaining_cash', TOTAL_CAPITAL):.0f}</b></div><div class="stat"><span>有色/稀土</span><b>{len(metals)}</b></div><div class="stat"><span>有效标的</span><b>{len(results)}</b></div></section>
 <section class="notes"><h2>我的持仓与最新操作建议</h2><p>操作建议依据最新可用净值、均线、动量、回撤和赎回费期限生成；待确认订单不重复加仓。</p></section>
 <section class="table-panel"><table><thead><tr><th>持有基金</th><th>买入时间</th><th>金额</th><th>状态</th><th>最新净值</th><th>趋势</th><th>20日回撤</th><th>持仓收益</th><th>当前操作</th></tr></thead><tbody>{holding_rows or '<tr><td colspan="9">尚未录入持仓。</td></tr>'}</tbody></table></section>
+<section class="notes metals-heading" id="metals"><h2>有色金属与稀土专区</h2><p>已固定跟踪支付宝场外联接基金和场内 ETF。按 1/3/5 日短动量排序，动作仍受均线、回撤、赎回费和场内佣金约束。</p></section>
+<section class="table-panel"><table><thead><tr><th>有色/稀土标的</th><th>数据日期</th><th>1日</th><th>3日</th><th>5日</th><th>7日短动量</th><th>MA20 / MA60</th><th>当前动作</th></tr></thead><tbody>{metals_rows or '<tr><td colspan="8">本次有色金属数据获取失败，已保留标的并等待下次重试。</td></tr>'}</tbody></table></section>
 <section class="notes"><h2>{TARGET_DAILY_MOVE:.1f}%+ 七日高弹性候选</h2><p>按 1/3/5 日短动量筛选，计划最长持有 {MAX_PLANNED_HOLD_DAYS} 天；只有最新 1 日涨幅 ≥{TARGET_DAILY_MOVE:.1f}% 且趋势通过的标的才可能进入买入观察。</p></section>
 <div class="toolbar"><input id="search" type="search" placeholder="搜索名称或代码"><select id="kind"><option value="all">全部标的</option><option value="alipay_a">支付宝 A 类</option><option value="alipay_c">支付宝 C 类</option><option value="linked_c">自动匹配 C 类</option><option value="etf">场内 ETF</option></select></div>
 <section class="table-panel"><table><thead><tr><th>排名</th><th>标的</th><th>数据日期</th><th>最新1日</th><th>20日最大单日涨幅</th><th>7日短动量</th><th>池内分位</th><th>20日收益 / RS</th><th>MA20 / MA60</th><th>20日回撤</th><th>动作与依据</th></tr></thead><tbody id="rows">{rows}</tbody></table></section>
