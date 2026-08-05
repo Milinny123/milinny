@@ -676,6 +676,64 @@ def _rank_results(results: list[dict[str, Any]]) -> None:
             item["amount"] = 0
 
 
+def _fetch_manager_frame() -> tuple[pd.DataFrame, list[int]]:
+    """Fetch manager pages independently so one failed page does not discard all data."""
+    from akshare.utils import demjson
+
+    url = "https://fund.eastmoney.com/Data/FundDataPortfolio_Interface.aspx"
+    base_params = {
+        "dt": "14",
+        "mc": "returnjson",
+        "ft": "all",
+        "pn": "500",
+        "sc": "abbname",
+        "st": "asc",
+    }
+
+    def decode(response: requests.Response) -> dict[str, Any]:
+        response.raise_for_status()
+        payload = re.sub(r"^\s*var\s+returnjson\s*=\s*", "", response.text).strip().rstrip(";")
+        return demjson.decode(payload)
+
+    session = requests.Session()
+    pages: list[pd.DataFrame] = []
+    failed_pages: list[int] = []
+    try:
+        first = decode(session.get(url, params={**base_params, "pi": 1}, timeout=12))
+        total_pages = int(first.get("pages", 1))
+        for page in range(1, total_pages + 1):
+            page_data = first if page == 1 else None
+            if page_data is None:
+                for _attempt in range(3):
+                    try:
+                        page_data = decode(
+                            session.get(url, params={**base_params, "pi": page}, timeout=12)
+                        )
+                        break
+                    except (requests.RequestException, ValueError):
+                        continue
+            if page_data is None:
+                failed_pages.append(page)
+                continue
+            frame = pd.DataFrame(page_data.get("data", []))
+            if not frame.empty:
+                pages.append(frame)
+    finally:
+        session.close()
+    if not pages:
+        raise ValueError("基金经理分页均未返回有效数据")
+    combined = pd.concat(pages, ignore_index=True)
+    if combined.shape[1] < 11:
+        raise ValueError(f"基金经理原始字段不足: {combined.shape[1]}")
+    return pd.DataFrame(
+        {
+            "姓名": combined.iloc[:, 1],
+            "现任基金代码": combined.iloc[:, 4],
+            "累计从业时间": pd.to_numeric(combined.iloc[:, 6], errors="coerce"),
+        }
+    ), failed_pages
+
+
 def enrich_manager_experience(results: list[dict[str, Any]], failures: list[str]) -> None:
     """Attach current manager names and cumulative industry experience."""
     for item in results:
@@ -686,9 +744,11 @@ def enrich_manager_experience(results: list[dict[str, Any]], failures: list[str]
                 "manager_verified": False,
                 "manager_preference_met": False,
             }
-        )
+    )
     try:
-        frame = _ak_call(lambda: ak.fund_manager_em(), seconds=25)
+        frame, failed_pages = _fetch_manager_frame()
+        if failed_pages:
+            failures.append(f"基金经理分页 {failed_pages} 暂时失败，其余页面继续使用")
         required = {"姓名", "现任基金代码", "累计从业时间"}
         if frame is None or frame.empty or not required.issubset(frame.columns):
             raise ValueError(f"基金经理字段不完整: {list(getattr(frame, 'columns', []))}")
