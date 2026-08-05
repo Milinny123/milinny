@@ -509,8 +509,12 @@ def build_watchlist(
         catalog = _fund_catalog()
         items = _validate_core_funds(items, catalog, failures)
     except Exception as exc:
-        failures.append(f"核心基金代码名称在线核验失败，场外基金已全部跳过：{_short_error(exc)}")
-        items = [item for item in items if item["kind"] != "alipay_c"]
+        failures.append(
+            f"核心基金目录在线核验失败，继续使用已配置核心池并逐只抓取净值：{_short_error(exc)}"
+        )
+        for item in items:
+            if item["kind"] == "alipay_c":
+                item["name_verified"] = False
     existing = {item["code"] for item in items}
     for position in holdings or []:
         if position["code"] not in existing:
@@ -817,7 +821,9 @@ def _news_sentiment(text: str) -> int:
 def enrich_news_and_scenarios(results: list[dict[str, Any]], failures: list[str], now: datetime) -> None:
     """Add a bounded technical scenario estimate and recent theme-news context."""
     for item in results:
-        item.update({"news_sentiment": 0, "news_titles": [], "news_keyword": _news_keyword(item)})
+        item.update(
+            {"news_sentiment": 0, "news_titles": [], "news_items": [], "news_keyword": _news_keyword(item)}
+        )
 
     candidates = sorted(
         (item for item in results if item["action"] in {"买入观察", "持有/观察"} or item["code"] in METALS_CODES),
@@ -838,10 +844,13 @@ def enrich_news_and_scenarios(results: list[dict[str, Any]], failures: list[str]
             frame = _ak_call(lambda keyword=keyword: ak.stock_news_em(symbol=keyword), seconds=15)
             title_col = _first_existing(frame, ("新闻标题", "标题", "title"))
             time_col = _first_existing(frame, ("发布时间", "时间", "datetime"))
+            source_col = _first_existing(frame, ("文章来源", "来源", "source"))
+            link_col = _first_existing(frame, ("新闻链接", "链接", "url"))
             if frame is None or frame.empty or not title_col:
-                news_cache[keyword] = {"score": 0, "titles": []}
+                news_cache[keyword] = {"score": 0, "titles": [], "items": []}
                 continue
             recent: list[str] = []
+            recent_items: list[dict[str, str]] = []
             for _, row in frame.iterrows():
                 if time_col:
                     published = pd.to_datetime(row[time_col], errors="coerce")
@@ -853,18 +862,27 @@ def enrich_news_and_scenarios(results: list[dict[str, Any]], failures: list[str]
                 title = str(row[title_col]).strip()
                 if title and title != "nan" and title not in recent:
                     recent.append(title)
+                    recent_items.append(
+                        {
+                            "title": title,
+                            "source": str(row[source_col]).strip() if source_col else "东方财富检索",
+                            "published": str(row[time_col]).strip() if time_col else "",
+                            "url": str(row[link_col]).strip() if link_col else "",
+                        }
+                    )
                 if len(recent) >= 3:
                     break
             score = max(-2, min(2, sum(_news_sentiment(title) for title in recent)))
-            news_cache[keyword] = {"score": score, "titles": recent}
+            news_cache[keyword] = {"score": score, "titles": recent, "items": recent_items}
         except Exception as exc:
-            news_cache[keyword] = {"score": 0, "titles": []}
+            news_cache[keyword] = {"score": 0, "titles": [], "items": []}
             failures.append(f"{keyword}近期新闻：{_short_error(exc)}")
 
     for item in results:
-        news = news_cache.get(item["news_keyword"], {"score": 0, "titles": []})
+        news = news_cache.get(item["news_keyword"], {"score": 0, "titles": [], "items": []})
         item["news_sentiment"] = news["score"]
         item["news_titles"] = news["titles"]
+        item["news_items"] = news["items"]
         technical_center = item["r1"] * 0.45 + item["r3"] / 3 * 0.30 + item["r5"] / 5 * 0.25
         news_adjustment = news["score"] * 0.15
         volatility = max(0.35, item["daily_volatility20"])
@@ -1361,9 +1379,7 @@ def build_dashboard(context: dict[str, Any], title: str) -> str:
     metals_rows = "".join(_dashboard_metals_row(item) for item in metals)
     decision_items = [item for item in results if item["action"] == "买入观察"][:3]
     if not decision_items:
-        decision_items = [
-            item for item in results if not item["stop"] and not item["stale"] and item["above_ma20"]
-        ][:3]
+        decision_items = [item for item in results if item["action"] == "持有/观察"][:3]
     decision_cards = "".join(_dashboard_decision_card(item) for item in decision_items)
     failures = "".join(f"<li>{html.escape(failure)}</li>" for failure in context["failures"])
     intraday = context.get("intraday_t0", [])
@@ -1418,7 +1434,7 @@ const data=JSON.parse(document.getElementById('dashboard-data').textContent); co
 function filterRows(){{const q=search.value.trim().toLowerCase(), k=kind.value; document.querySelectorAll('#rows tr').forEach(row=>{{const text=row.textContent.toLowerCase(); row.hidden=(q&&!text.includes(q))||(k!=='all'&&row.dataset.kind!==k);}});}}
 search.addEventListener('input',filterRows); kind.addEventListener('change',filterRows);
 function addText(parent,tag,text,className){{const node=document.createElement(tag); node.textContent=text; if(className)node.className=className; parent.appendChild(node); return node;}}
-function runQuery(){{const q=fundQuery.value.trim().toLowerCase(); queryResult.replaceChildren(); queryResult.classList.add('visible'); if(!q){{addText(queryResult,'p','请输入基金代码或名称。'); return;}} const matches=data.results.filter(item=>item.code.toLowerCase()===q||item.name.toLowerCase().includes(q)); if(!matches.length){{addText(queryResult,'h3','本次扫描池中没有找到'); addText(queryResult,'p','请把基金代码发给我，我可以先核验代码、费率和数据，再决定是否加入固定扫描池。'); return;}} const item=matches[0]; addText(queryResult,'h3',item.code+' · '+item.name); const grid=addText(queryResult,'div','', 'query-grid'); const holding=item.fee_free_days?('至少 '+item.fee_free_days+' 天'):(item.kind==='etf'?'1～7 天复核':'赎回前核对费率'); const manager=item.manager_years!=null?(item.manager_names+' · '+item.manager_years.toFixed(1)+' 年'):'待核验'; [['当前结论',item.action],['建议金额',(item.amount||0)+' 元'],['计划持有',holding],['基金经理',manager],['1/3/5日',item.r1.toFixed(2)+'% / '+item.r3.toFixed(2)+'% / '+item.r5.toFixed(2)+'%'],['次日情景',item.next_day_low.toFixed(2)+'% ～ '+item.next_day_high.toFixed(2)+'%'],['置信度',item.forecast_confidence],['数据日期',item.data_date]].forEach(pair=>{{const box=addText(grid,'span',pair[0]); addText(box,'b',pair[1]);}}); addText(queryResult,'p','提示：情景区间由近期波动、趋势和有限新闻标题估算，不是收益承诺。'); if(item.news_titles&&item.news_titles.length){{const list=addText(queryResult,'ul','', 'news-list'); item.news_titles.forEach(title=>addText(list,'li',title));}}}}
+function runQuery(){{const q=fundQuery.value.trim().toLowerCase(); queryResult.replaceChildren(); queryResult.classList.add('visible'); if(!q){{addText(queryResult,'p','请输入基金代码或名称。'); return;}} const matches=data.results.filter(item=>item.code.toLowerCase()===q||item.name.toLowerCase().includes(q)); if(!matches.length){{addText(queryResult,'h3','本次扫描池中没有找到'); addText(queryResult,'p','请把基金代码发给我，我可以先核验代码、费率和数据，再决定是否加入固定扫描池。'); return;}} const item=matches[0]; addText(queryResult,'h3',item.code+' · '+item.name); const grid=addText(queryResult,'div','', 'query-grid'); const holding=item.fee_free_days?('至少 '+item.fee_free_days+' 天'):(item.kind==='etf'?'1～7 天复核':'赎回前核对费率'); const manager=item.manager_years!=null?(item.manager_names+' · '+item.manager_years.toFixed(1)+' 年'):'待核验'; [['当前结论',item.action],['建议金额',(item.amount||0)+' 元'],['计划持有',holding],['基金经理',manager],['1/3/5日',item.r1.toFixed(2)+'% / '+item.r3.toFixed(2)+'% / '+item.r5.toFixed(2)+'%'],['次日情景',item.next_day_low.toFixed(2)+'% ～ '+item.next_day_high.toFixed(2)+'%'],['置信度',item.forecast_confidence],['数据日期',item.data_date]].forEach(pair=>{{const box=addText(grid,'span',pair[0]); addText(box,'b',pair[1]);}}); addText(queryResult,'p','提示：情景区间由近期波动、趋势和有限新闻标题估算，不是收益承诺。'); const newsItems=item.news_items||[]; if(newsItems.length){{const list=addText(queryResult,'ul','', 'news-list'); newsItems.forEach(news=>{{const li=document.createElement('li'); const link=document.createElement('a'); link.textContent=news.title; if(/^https?:\/\//.test(news.url)){{link.href=news.url; link.target='_blank'; link.rel='noopener noreferrer';}} li.appendChild(link); addText(li,'small',(news.source||'来源待核验')+(news.published?' · '+news.published:'')); list.appendChild(li);}});}}}}
 queryButton.addEventListener('click',runQuery); fundQuery.addEventListener('keydown',event=>{{if(event.key==='Enter')runQuery();}});
 </script></main></body></html>'''
 
