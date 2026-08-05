@@ -64,6 +64,8 @@ INTRADAY_MAX_ROUND_TRIP_COST_PCT = _non_negative_float_env(
 )
 TARGET_DAILY_MOVE = _non_negative_float_env("TARGET_DAILY_MOVE", 3.0)
 MOMENTUM_WEIGHTS = (0.65, 0.25, 0.10) if RISK_PROFILE == "aggressive" else (0.50, 0.30, 0.20)
+SHORT_MOMENTUM_WEIGHTS = (0.45, 0.30, 0.25)
+MAX_PLANNED_HOLD_DAYS = _positive_int_env("MAX_PLANNED_HOLD_DAYS", 7)
 SIGNAL_PERCENTILE = 80 if RISK_PROFILE == "aggressive" else 70
 SIGNAL_MIN_SCORE = 1.5 if RISK_PROFILE == "aggressive" else 0.0
 REQUIRE_MA60 = RISK_PROFILE != "aggressive"
@@ -97,8 +99,15 @@ CORE_WATCHLIST: list[dict[str, Any]] = [
     {"code": "004070", "name": "南方中证全指证券公司ETF联接C", "kind": "alipay_c", "data_codes": ("004070",)},
     {"code": "007467", "name": "华泰柏瑞中证红利低波ETF联接C", "kind": "alipay_c", "data_codes": ("007467",)},
     {"code": "000217", "name": "华安黄金ETF联接C", "kind": "alipay_c", "data_codes": ("000217",)},
+    {"code": "004433", "name": "南方有色金属ETF联接C", "kind": "alipay_c", "data_codes": ("004433",)},
+    {"code": "017193", "name": "天弘中证工业有色金属主题ETF发起联接C", "kind": "alipay_c", "data_codes": ("017193",)},
+    {"code": "018168", "name": "国泰有色矿业ETF联接C", "kind": "alipay_c", "data_codes": ("018168",)},
+    {"code": "011036", "name": "嘉实中证稀土产业ETF联接C", "kind": "alipay_c", "data_codes": ("011036",)},
     {"code": "588000", "name": "科创50ETF", "kind": "etf", "data_codes": ("588000",)},
     {"code": "512480", "name": "半导体ETF", "kind": "etf", "data_codes": ("512480",)},
+    {"code": "512400", "name": "有色金属ETF南方", "kind": "etf", "data_codes": ("512400",)},
+    {"code": "159876", "name": "有色ETF华宝", "kind": "etf", "data_codes": ("159876",)},
+    {"code": "516150", "name": "稀土ETF嘉实", "kind": "etf", "data_codes": ("516150",)},
 ]
 
 
@@ -542,7 +551,7 @@ def analyse_item(
     if len(history) < 61:
         raise ValueError(f"有效数据 {len(history)} 条，少于 61 条")
     close = history["close"]
-    returns = {days: _return(close, days) for days in (1, 5, 20, 60)}
+    returns = {days: _return(close, days) for days in (1, 3, 5, 20, 60)}
     daily_returns = close.pct_change().dropna().tail(20) * 100
     max_daily_gain20 = float(daily_returns.max())
     daily_volatility20 = float(daily_returns.std(ddof=0))
@@ -559,6 +568,11 @@ def analyse_item(
         + returns[20] * MOMENTUM_WEIGHTS[1]
         + returns[60] * MOMENTUM_WEIGHTS[2]
     )
+    short_score = (
+        returns[1] * SHORT_MOMENTUM_WEIGHTS[0]
+        + returns[3] * SHORT_MOMENTUM_WEIGHTS[1]
+        + returns[5] * SHORT_MOMENTUM_WEIGHTS[2]
+    )
     rs20 = returns[20] - benchmark_returns.get(20, 0.0)
     rs60 = returns[60] - benchmark_returns.get(60, 0.0)
     return {
@@ -570,10 +584,13 @@ def analyse_item(
         "stale": data_age_days > MAX_DATA_AGE_DAYS,
         "latest": latest,
         "r1": returns[1],
+        "r3": returns[3],
         "r5": returns[5],
         "r20": returns[20],
         "r60": returns[60],
         "score": score,
+        "short_score": short_score,
+        "selection_score": short_score if RISK_PROFILE == "aggressive" else score,
         "ma20": ma20,
         "ma60": ma60,
         "above_ma20": latest >= ma20,
@@ -594,7 +611,7 @@ def analyse_item(
 def _rank_results(results: list[dict[str, Any]]) -> None:
     if not results:
         return
-    ordered = sorted(results, key=lambda row: row["score"], reverse=True)
+    ordered = sorted(results, key=lambda row: row["selection_score"], reverse=True)
     total = len(ordered)
     for rank, item in enumerate(ordered, start=1):
         item["rank"] = rank
@@ -610,7 +627,9 @@ def _rank_results(results: list[dict[str, Any]]) -> None:
             item["action"] = "风控止损"
             item["amount"] = 0
         elif (
-            item["score"] >= SIGNAL_MIN_SCORE
+            item["selection_score"] >= SIGNAL_MIN_SCORE
+            and item["r3"] > 0
+            and item["r5"] > 0
             and item["above_ma20"]
             and (item["above_ma60"] or not REQUIRE_MA60)
             and item["pool_percentile"] >= SIGNAL_PERCENTILE
@@ -621,7 +640,7 @@ def _rank_results(results: list[dict[str, Any]]) -> None:
         ):
             proposed_amount = (
                 HIGH_CONVICTION_BUY
-                if item["pool_percentile"] >= 90 and item["score"] >= 4
+                if item["pool_percentile"] >= 90 and item["selection_score"] >= 4
                 else STANDARD_BUY
             )
             item["suggested_amount"] = proposed_amount
@@ -688,6 +707,12 @@ def enrich_redemption_fees(
                 item["action"] = "费率待核验"
                 item["amount"] = 0
                 failures.append(f"{item['code']} {item['name']}：未识别到零赎回费持有期限，已取消买入信号")
+            elif fee_free_days and fee_free_days > MAX_PLANNED_HOLD_DAYS and not is_holding:
+                item["action"] = "持有期不匹配"
+                item["amount"] = 0
+                failures.append(
+                    f"{item['code']} {item['name']}：预计免赎回费需 {fee_free_days} 天，超过计划持有 {MAX_PLANNED_HOLD_DAYS} 天，已取消买入信号"
+                )
         except Exception as exc:
             item["fee_verified"] = False
             if not is_holding:
@@ -710,6 +735,11 @@ def _position_advice(position: dict[str, Any], item: dict[str, Any] | None, now:
         if fee_days
         else f"已持有约 {held_days} 天，赎回费期限待支付宝页面核对"
     )
+    if held_days >= MAX_PLANNED_HOLD_DAYS:
+        return (
+            f"已到 {MAX_PLANNED_HOLD_DAYS} 天计划复核点：停止加仓，优先核对实际确认日和赎回费；"
+            f"若手续费可接受则分批止盈/退出；{lock_text}"
+        )
     if item["stop"]:
         return f"停止加仓并进入减仓观察；{lock_text}，未满足免赎回费期限时先权衡手续费"
     if not item["above_ma20"]:
@@ -791,7 +821,7 @@ def analyse_market(now: datetime | None = None) -> dict[str, Any]:
     invested_amount = sum(position["amount"] for position in holdings)
     apply_cash_limit(results, invested_amount, holding_codes)
     enrich_redemption_fees(results, failures, holding_codes)
-    results.sort(key=lambda row: row["score"], reverse=True)
+    results.sort(key=lambda row: row["selection_score"], reverse=True)
     enriched_holdings = enrich_holdings(holdings, results, now)
     intraday_t0 = scan_intraday_t0(failures)
     return {
@@ -826,6 +856,8 @@ def _action_text(item: dict[str, Any]) -> str:
         )
     if item["action"] == "费率待核验":
         return "赎回费率未能实时核验，停止给出买入信号"
+    if item["action"] == "持有期不匹配":
+        return f"免赎回费期限超过计划持有 {MAX_PLANNED_HOLD_DAYS} 天，取消买入"
     if item["action"] == "现金不足":
         return "当前持仓已占用绝大部分资金，剩余现金低于单笔下限，不再新增买入"
     if item["action"] == "买入观察":
@@ -845,10 +877,10 @@ def _action_text(item: dict[str, Any]) -> str:
 def _line(item: dict[str, Any]) -> str:
     trend = f"MA20 {'上方' if item['above_ma20'] else '下方'} / MA60 {'上方' if item['above_ma60'] else '下方'}"
     return (
-        f"- **{item['code']} {item['name']}**（{item['kind']}）：1/5/20/60日 "
-        f"{item['r1']:.2f}% / {item['r5']:.2f}% / {item['r20']:.2f}% / {item['r60']:.2f}%，"
+        f"- **{item['code']} {item['name']}**（{item['kind']}）：1/3/5/20/60日 "
+        f"{item['r1']:.2f}% / {item['r3']:.2f}% / {item['r5']:.2f}% / {item['r20']:.2f}% / {item['r60']:.2f}%，"
         f"近20日最大单日上涨 **{item['max_daily_gain20']:.2f}%**（≥{TARGET_DAILY_MOVE:.1f}% 共 {item['target_move_days20']} 次），"
-        f"日波动率 {item['daily_volatility20']:.2f}%，动量 **{item['score']:.2f}**，"
+        f"日波动率 {item['daily_volatility20']:.2f}%，7日短动量 **{item['short_score']:.2f}**，"
         f"池内分位 **{item['pool_percentile']:.1f}%**（约前 {item['pool_top_percent']}%）；"
         f"数据日期 {item['data_date']}，{trend}，相对沪深300超额20/60日 {item['rs20']:.2f}% / {item['rs60']:.2f}%，"
         f"回撤 {item['drawdown']:.2f}%，**{_action_text(item)}**。"
@@ -864,7 +896,7 @@ def _holding_line(position: dict[str, Any]) -> str:
         else "，截图未含成交净值，暂不计算盈亏"
     )
     signal = (
-        f"；最新1日 {item['r1']:.2f}%，动量 {item['score']:.2f}，MA20 {'上方' if item['above_ma20'] else '下方'}，"
+        f"；最新1日 {item['r1']:.2f}%，7日短动量 {item['short_score']:.2f}，MA20 {'上方' if item['above_ma20'] else '下方'}，"
         f"20日回撤 {item['drawdown']:.2f}%"
         if item
         else "；本次行情获取失败"
@@ -908,10 +940,10 @@ def build_report(context: dict[str, Any]) -> tuple[str, str]:
             for item in results
             if item["r1"] >= TARGET_DAILY_MOVE and item["high_move_capable"] and not item["stale"]
         ),
-        key=lambda item: (item["r1"], item["max_daily_gain20"], item["score"]),
+        key=lambda item: (item["r1"], item["max_daily_gain20"], item["selection_score"]),
         reverse=True,
     )
-    title = "早盘全市场风向与动量预选" if mode == "morning" else "支付宝 14:30 实操买卖指南"
+    title = "早盘 7 日高弹性动量预选" if mode == "morning" else "支付宝 14:30 七日波段实操指南"
     benchmark = context["benchmark_returns"]
     lines = [
         f"# {title}",
@@ -969,7 +1001,8 @@ def build_report(context: dict[str, Any]) -> tuple[str, str]:
         "",
         "**支付宝 C 类风控：** 不同基金赎回费规则不同；脚本会实时核验出现买入信号的基金，必须按报告给出的免赎回费持有期限执行，并以支付宝购买页为最终依据。",
         "",
-        f"**风险提示：** 当前为{'进攻' if RISK_PROFILE == 'aggressive' else '均衡'}档，短期收益权重为 {MOMENTUM_WEIGHTS[0]:.0%}，可能带来更大回撤；不代表收益预测。",
+        f"**7日纪律：** 计划最长持有 {MAX_PLANNED_HOLD_DAYS} 天；场外基金只有免赎回费期限不超过该计划时才允许出现买入信号，到期必须复核。",
+        f"**风险提示：** 当前为{'进攻' if RISK_PROFILE == 'aggressive' else '均衡'}档，1/3/5日短动量权重为 45%/30%/25%，可能带来更大回撤；不代表收益预测。",
         f"**3%目标说明：** 仅表示近20个交易日曾出现单日上涨 ≥{TARGET_DAILY_MOVE:.1f}%，不代表下一交易日或每天都能上涨 {TARGET_DAILY_MOVE:.1f}%。",
         "**免责声明：** 本报告由量化脚本自动生成，仅供研究参考，不构成投资建议。",
     ]
@@ -991,7 +1024,7 @@ def _dashboard_row(item: dict[str, Any]) -> str:
         f"<td><strong>{html.escape(item['name'])}</strong><small>{html.escape(item['code'])} · {kind_label}</small></td>"
         f"<td>{html.escape(item['data_date'])}</td>"
         f"<td>{item['r1']:.2f}%</td><td>{item['max_daily_gain20']:.2f}%<small>达标 {item['target_move_days20']} 次</small></td>"
-        f"<td>{item['score']:.2f}</td><td>{item['pool_percentile']:.1f}%</td>"
+        f"<td>{item['short_score']:.2f}</td><td>{item['pool_percentile']:.1f}%</td>"
         f"<td>{item['r20']:.2f}%<br><small>RS {item['rs20']:.2f}%</small></td>"
         f"<td>{'是' if item['above_ma20'] else '否'} / {'是' if item['above_ma60'] else '否'}</td>"
         f"<td class='{'danger' if item['stop'] else ''}'>{item['drawdown']:.2f}%</td>"
@@ -1073,9 +1106,9 @@ main {{ max-width:1240px; margin:0 auto; padding:32px 20px 56px; }} header {{ di
 <section class="stats"><div class="stat"><span>当前持仓</span><b>{len(holdings)}</b></div><div class="stat"><span>已投入</span><b>{context.get('invested_amount', 0):.0f}</b></div><div class="stat"><span>剩余资金</span><b>{context.get('remaining_cash', TOTAL_CAPITAL):.0f}</b></div><div class="stat"><span>有效标的</span><b>{len(results)}</b></div><div class="stat"><span>触发风控</span><b>{sum(item['stop'] for item in results)}</b></div></section>
 <section class="notes"><h2>我的持仓与最新操作建议</h2><p>操作建议依据最新可用净值、均线、动量、回撤和赎回费期限生成；待确认订单不重复加仓。</p></section>
 <section class="table-panel"><table><thead><tr><th>持有基金</th><th>买入时间</th><th>金额</th><th>状态</th><th>最新净值</th><th>趋势</th><th>20日回撤</th><th>持仓收益</th><th>当前操作</th></tr></thead><tbody>{holding_rows or '<tr><td colspan="9">尚未录入持仓。</td></tr>'}</tbody></table></section>
-<section class="notes"><h2>{TARGET_DAILY_MOVE:.1f}%+ 高波动候选与交易操作</h2><p>仅将近 20 个交易日曾出现单日上涨 ≥{TARGET_DAILY_MOVE:.1f}% 的标的纳入进攻买入候选；历史高波动不代表未来每天上涨。</p></section>
+<section class="notes"><h2>{TARGET_DAILY_MOVE:.1f}%+ 七日高弹性候选</h2><p>按 1/3/5 日短动量筛选，计划最长持有 {MAX_PLANNED_HOLD_DAYS} 天；只有最新 1 日涨幅 ≥{TARGET_DAILY_MOVE:.1f}% 且趋势通过的标的才可能进入买入观察。</p></section>
 <div class="toolbar"><input id="search" type="search" placeholder="搜索名称或代码"><select id="kind"><option value="all">全部标的</option><option value="alipay_a">支付宝 A 类</option><option value="alipay_c">支付宝 C 类</option><option value="linked_c">自动匹配 C 类</option><option value="etf">场内 ETF</option></select></div>
-<section class="table-panel"><table><thead><tr><th>排名</th><th>标的</th><th>数据日期</th><th>最新1日</th><th>20日最大单日涨幅</th><th>动量得分</th><th>池内分位</th><th>20日收益 / RS</th><th>MA20 / MA60</th><th>20日回撤</th><th>动作与依据</th></tr></thead><tbody id="rows">{rows}</tbody></table></section>
+<section class="table-panel"><table><thead><tr><th>排名</th><th>标的</th><th>数据日期</th><th>最新1日</th><th>20日最大单日涨幅</th><th>7日短动量</th><th>池内分位</th><th>20日收益 / RS</th><th>MA20 / MA60</th><th>20日回撤</th><th>动作与依据</th></tr></thead><tbody id="rows">{rows}</tbody></table></section>
 <section class="notes"><h2>T+0 日内盈利可执行性</h2><p>仅列出规则允许当日回转的代表性债券、黄金和跨境 ETF。成本门槛通过不等于盈利预测；回本涨幅还未计买卖价差、滑点和溢价风险。</p></section>
 <section class="table-panel"><table><thead><tr><th>T+0 标的</th><th>现价</th><th>当日涨跌</th><th>1 手金额</th><th>最多成交</th><th>佣金回本涨幅</th><th>结论</th></tr></thead><tbody>{intraday_rows or '<tr><td colspan="7">本次未获取到可核验的 T+0 行情。</td></tr>'}</tbody></table></section>
 <section class="notes"><h2>风控与数据状态</h2><p>总资金 {TOTAL_CAPITAL} 元，单笔加仓控制在 {BUY_MIN}～{BUY_MAX} 元。场内 ETF 按买卖各最低 {BROKER_MIN_COMMISSION:.0f} 元佣金过滤，往返成本超过 {MAX_EXCHANGE_ROUND_TRIP_COST_PCT:.1f}% 时只观察；支付宝 C 类按实时赎回费率给出最低计划持有天数，最终以购买页为准。</p>{f'<ul>{failures}</ul>' if failures else '<p>本次扫描未记录接口失败。</p>'}</section>
