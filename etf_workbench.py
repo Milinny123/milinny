@@ -66,6 +66,9 @@ TARGET_DAILY_MOVE = _non_negative_float_env("TARGET_DAILY_MOVE", 3.0)
 MOMENTUM_WEIGHTS = (0.65, 0.25, 0.10) if RISK_PROFILE == "aggressive" else (0.50, 0.30, 0.20)
 SHORT_MOMENTUM_WEIGHTS = (0.45, 0.30, 0.25)
 MAX_PLANNED_HOLD_DAYS = _positive_int_env("MAX_PLANNED_HOLD_DAYS", 7)
+MANAGER_MIN_YEARS = _non_negative_float_env("MANAGER_MIN_YEARS", 10.0)
+NEWS_LOOKBACK_DAYS = 3
+NEWS_MAX_THEMES = 6
 SIGNAL_PERCENTILE = 80 if RISK_PROFILE == "aggressive" else 70
 SIGNAL_MIN_SCORE = 1.5 if RISK_PROFILE == "aggressive" else 0.0
 REQUIRE_MA60 = RISK_PROFILE != "aggressive"
@@ -673,6 +676,148 @@ def _rank_results(results: list[dict[str, Any]]) -> None:
             item["amount"] = 0
 
 
+def enrich_manager_experience(results: list[dict[str, Any]], failures: list[str]) -> None:
+    """Attach current manager names and cumulative industry experience."""
+    for item in results:
+        item.update(
+            {
+                "manager_names": "待核验",
+                "manager_years": None,
+                "manager_verified": False,
+                "manager_preference_met": False,
+            }
+        )
+    try:
+        frame = _ak_call(lambda: ak.fund_manager_em(), seconds=25)
+        required = {"姓名", "现任基金代码", "累计从业时间"}
+        if frame is None or frame.empty or not required.issubset(frame.columns):
+            raise ValueError(f"基金经理字段不完整: {list(getattr(frame, 'columns', []))}")
+        by_code: dict[str, list[dict[str, Any]]] = {}
+        for _, row in frame.iterrows():
+            days = pd.to_numeric(row["累计从业时间"], errors="coerce")
+            if pd.isna(days):
+                continue
+            record = {"name": str(row["姓名"]).strip(), "years": float(days) / 365.25}
+            for code in set(re.findall(r"\d{6}", str(row["现任基金代码"]))):
+                by_code.setdefault(code, []).append(record)
+        for item in results:
+            managers = by_code.get(item["code"], [])
+            if not managers:
+                continue
+            manager_years = min(manager["years"] for manager in managers)
+            item.update(
+                {
+                    "manager_names": " / ".join(dict.fromkeys(manager["name"] for manager in managers)),
+                    "manager_years": manager_years,
+                    "manager_verified": True,
+                    "manager_preference_met": manager_years >= MANAGER_MIN_YEARS,
+                }
+            )
+    except Exception as exc:
+        failures.append(f"基金经理从业数据：{_short_error(exc)}")
+
+    for item in results:
+        if item.get("action") != "买入观察":
+            continue
+        if not item["manager_verified"]:
+            item["action"] = "经理待核验"
+            item["amount"] = 0
+        elif not item["manager_preference_met"]:
+            item["action"] = "经理年限未达偏好"
+            item["amount"] = 0
+
+
+def _news_keyword(item: dict[str, Any]) -> str:
+    name = item["name"]
+    keyword_groups = (
+        (("有色", "矿业"), "有色金属"),
+        (("稀土",), "稀土"),
+        (("半导体", "芯片"), "半导体"),
+        (("人工智能", "AI"), "人工智能"),
+        (("医疗", "医药"), "医疗医药"),
+        (("消费电子",), "消费电子"),
+        (("证券", "券商"), "证券"),
+        (("黄金",), "黄金"),
+        (("恒生科技", "互联网"), "互联网科技"),
+        (("游戏", "动漫"), "游戏"),
+        (("电力",), "电力"),
+    )
+    for words, keyword in keyword_groups:
+        if any(word in name for word in words):
+            return keyword
+    return re.sub(r"(?:ETF|联接|发起式|QDII|基金|[AC]|\([^)]*\))", "", name)[:12]
+
+
+def _news_sentiment(text: str) -> int:
+    positive = ("增长", "上涨", "突破", "利好", "增持", "复苏", "提振", "创新高", "扩产")
+    negative = ("下跌", "回落", "利空", "减持", "亏损", "调查", "处罚", "风险", "承压")
+    return sum(word in text for word in positive) - sum(word in text for word in negative)
+
+
+def enrich_news_and_scenarios(results: list[dict[str, Any]], failures: list[str], now: datetime) -> None:
+    """Add a bounded technical scenario estimate and recent theme-news context."""
+    for item in results:
+        item.update({"news_sentiment": 0, "news_titles": [], "news_keyword": _news_keyword(item)})
+
+    candidates = sorted(
+        (item for item in results if item["action"] in {"买入观察", "持有/观察"} or item["code"] in METALS_CODES),
+        key=lambda item: item["selection_score"],
+        reverse=True,
+    )
+    themes: list[str] = []
+    for item in candidates:
+        if item["news_keyword"] not in themes:
+            themes.append(item["news_keyword"])
+        if len(themes) >= NEWS_MAX_THEMES:
+            break
+
+    news_cache: dict[str, dict[str, Any]] = {}
+    cutoff = now.astimezone(BEIJING_TZ) - timedelta(days=NEWS_LOOKBACK_DAYS)
+    for keyword in themes:
+        try:
+            frame = _ak_call(lambda keyword=keyword: ak.stock_news_em(symbol=keyword), seconds=15)
+            title_col = _first_existing(frame, ("新闻标题", "标题", "title"))
+            time_col = _first_existing(frame, ("发布时间", "时间", "datetime"))
+            if frame is None or frame.empty or not title_col:
+                news_cache[keyword] = {"score": 0, "titles": []}
+                continue
+            recent: list[str] = []
+            for _, row in frame.iterrows():
+                if time_col:
+                    published = pd.to_datetime(row[time_col], errors="coerce")
+                    if pd.notna(published):
+                        if published.tzinfo is None:
+                            published = published.tz_localize(BEIJING_TZ)
+                        if published.to_pydatetime() < cutoff:
+                            continue
+                title = str(row[title_col]).strip()
+                if title and title != "nan" and title not in recent:
+                    recent.append(title)
+                if len(recent) >= 3:
+                    break
+            score = max(-2, min(2, sum(_news_sentiment(title) for title in recent)))
+            news_cache[keyword] = {"score": score, "titles": recent}
+        except Exception as exc:
+            news_cache[keyword] = {"score": 0, "titles": []}
+            failures.append(f"{keyword}近期新闻：{_short_error(exc)}")
+
+    for item in results:
+        news = news_cache.get(item["news_keyword"], {"score": 0, "titles": []})
+        item["news_sentiment"] = news["score"]
+        item["news_titles"] = news["titles"]
+        technical_center = item["r1"] * 0.45 + item["r3"] / 3 * 0.30 + item["r5"] / 5 * 0.25
+        news_adjustment = news["score"] * 0.15
+        volatility = max(0.35, item["daily_volatility20"])
+        center = max(-5.0, min(5.0, technical_center + news_adjustment))
+        radius = min(8.0, max(0.8, volatility * 1.28))
+        item["next_day_center"] = center
+        item["next_day_low"] = max(-10.0, center - radius)
+        item["next_day_high"] = min(10.0, center + radius)
+        item["forecast_confidence"] = (
+            "中" if news["titles"] and item["above_ma20"] and not item["stale"] else "低"
+        )
+
+
 def _redemption_fee_summary(frame: pd.DataFrame) -> tuple[str, int | None]:
     term_col = _first_existing(frame, ("适用期限", "持有期限", "期限"))
     rate_col = _first_existing(frame, ("赎回费率", "费率"))
@@ -831,7 +976,9 @@ def analyse_market(now: datetime | None = None) -> dict[str, Any]:
     invested_amount = sum(position["amount"] for position in holdings)
     apply_cash_limit(results, invested_amount, holding_codes)
     enrich_redemption_fees(results, failures, holding_codes)
+    enrich_manager_experience(results, failures)
     results.sort(key=lambda row: row["selection_score"], reverse=True)
+    enrich_news_and_scenarios(results, failures, now)
     enriched_holdings = enrich_holdings(holdings, results, now)
     intraday_t0 = scan_intraday_t0(failures)
     return {
@@ -868,6 +1015,13 @@ def _action_text(item: dict[str, Any]) -> str:
         return "赎回费率未能实时核验，停止给出买入信号"
     if item["action"] == "持有期不匹配":
         return f"免赎回费期限超过计划持有 {MAX_PLANNED_HOLD_DAYS} 天，取消买入"
+    if item["action"] == "经理待核验":
+        return "基金经理累计从业年限未核验，暂不新增资金"
+    if item["action"] == "经理年限未达偏好":
+        return (
+            f"基金经理累计从业约 {item.get('manager_years', 0):.1f} 年，未达到偏好值 "
+            f"{MANAGER_MIN_YEARS:.0f} 年，暂不新增资金"
+        )
     if item["action"] == "现金不足":
         return "当前持仓已占用绝大部分资金，剩余现金低于单笔下限，不再新增买入"
     if item["action"] == "买入观察":
@@ -886,6 +1040,11 @@ def _action_text(item: dict[str, Any]) -> str:
 
 def _line(item: dict[str, Any]) -> str:
     trend = f"MA20 {'上方' if item['above_ma20'] else '下方'} / MA60 {'上方' if item['above_ma60'] else '下方'}"
+    manager = (
+        f"{item.get('manager_names', '待核验')}，累计从业 {item['manager_years']:.1f} 年"
+        if item.get("manager_years") is not None
+        else "基金经理年限待核验"
+    )
     return (
         f"- **{item['code']} {item['name']}**（{item['kind']}）：1/3/5/20/60日 "
         f"{item['r1']:.2f}% / {item['r3']:.2f}% / {item['r5']:.2f}% / {item['r20']:.2f}% / {item['r60']:.2f}%，"
@@ -893,7 +1052,9 @@ def _line(item: dict[str, Any]) -> str:
         f"日波动率 {item['daily_volatility20']:.2f}%，7日短动量 **{item['short_score']:.2f}**，"
         f"池内分位 **{item['pool_percentile']:.1f}%**（约前 {item['pool_top_percent']}%）；"
         f"数据日期 {item['data_date']}，{trend}，相对沪深300超额20/60日 {item['rs20']:.2f}% / {item['rs60']:.2f}%，"
-        f"回撤 {item['drawdown']:.2f}%，**{_action_text(item)}**。"
+        f"回撤 {item['drawdown']:.2f}%；{manager}；次日情景区间 "
+        f"{item.get('next_day_low', 0):.2f}%～{item.get('next_day_high', 0):.2f}%（{item.get('forecast_confidence', '低')}置信度），"
+        f"**{_action_text(item)}**。"
     )
 
 
@@ -1037,6 +1198,8 @@ def _dashboard_row(item: dict[str, Any]) -> str:
         f"<td>{item['short_score']:.2f}</td><td>{item['pool_percentile']:.1f}%</td>"
         f"<td>{item['r20']:.2f}%<br><small>RS {item['rs20']:.2f}%</small></td>"
         f"<td>{'是' if item['above_ma20'] else '否'} / {'是' if item['above_ma60'] else '否'}</td>"
+        f"<td>{html.escape(item.get('manager_names', '待核验'))}<small>{html.escape(_manager_years_text(item))}</small></td>"
+        f"<td>{item.get('next_day_low', 0):.2f}% ～ {item.get('next_day_high', 0):.2f}%<small>{item.get('forecast_confidence', '低')}置信度</small></td>"
         f"<td class='{'danger' if item['stop'] else ''}'>{item['drawdown']:.2f}%</td>"
         f"<td class='{action_class}'>{html.escape(_action_text(item))}</td></tr>"
     )
@@ -1067,6 +1230,11 @@ def _dashboard_holding_row(position: dict[str, Any]) -> str:
     )
 
 
+def _manager_years_text(item: dict[str, Any]) -> str:
+    years = item.get("manager_years")
+    return f"累计 {years:.1f} 年" if years is not None else "年限待核验"
+
+
 def _dashboard_metals_row(item: dict[str, Any]) -> str:
     kind_label = "支付宝场外" if _is_alipay_fund(item["kind"]) else "场内 ETF"
     action_class = "danger" if item["stop"] else ("positive" if item["action"] == "买入观察" else "neutral")
@@ -1077,7 +1245,33 @@ def _dashboard_metals_row(item: dict[str, Any]) -> str:
         f"<td>{item['r1']:.2f}%</td><td>{item['r3']:.2f}%</td><td>{item['r5']:.2f}%</td>"
         f"<td>{item['short_score']:.2f}</td>"
         f"<td>{'上方' if item['above_ma20'] else '下方'} / {'上方' if item['above_ma60'] else '下方'}</td>"
+        f"<td>{html.escape(item.get('manager_names', '待核验'))}<small>{html.escape(_manager_years_text(item))}</small></td>"
+        f"<td>{item.get('next_day_low', 0):.2f}% ～ {item.get('next_day_high', 0):.2f}%<small>{item.get('forecast_confidence', '低')}置信度</small></td>"
         f"<td class='{action_class}'>{html.escape(_action_text(item))}</td></tr>"
+    )
+
+
+def _dashboard_decision_card(item: dict[str, Any]) -> str:
+    action = _action_text(item)
+    manager = (
+        f"{item.get('manager_names', '待核验')} · 累计 {item['manager_years']:.1f} 年"
+        if item.get("manager_years") is not None
+        else "基金经理年限待核验"
+    )
+    holding = (
+        f"至少 {item['fee_free_days']} 天"
+        if _is_alipay_fund(item["kind"]) and item.get("fee_free_days")
+        else ("按计划 1～7 天复核" if item["kind"] == "etf" else "赎回前核对费率")
+    )
+    return (
+        "<article class='decision-card'>"
+        f"<div class='decision-top'><span>{html.escape(item['code'])}</span><b>{html.escape(item['action'])}</b></div>"
+        f"<h3>{html.escape(item['name'])}</h3>"
+        f"<div class='decision-metrics'><span>建议金额<strong>{item.get('amount', 0):.0f} 元</strong></span>"
+        f"<span>计划持有<strong>{html.escape(holding)}</strong></span>"
+        f"<span>次日情景<strong>{item.get('next_day_low', 0):.2f}% ～ {item.get('next_day_high', 0):.2f}%</strong></span></div>"
+        f"<p>{html.escape(action)}</p><small>{html.escape(manager)}；情景估计为{item.get('forecast_confidence', '低')}置信度，不是收益保证。</small>"
+        "</article>"
     )
 
 
@@ -1105,6 +1299,12 @@ def build_dashboard(context: dict[str, Any], title: str) -> str:
         reverse=True,
     )
     metals_rows = "".join(_dashboard_metals_row(item) for item in metals)
+    decision_items = [item for item in results if item["action"] == "买入观察"][:3]
+    if not decision_items:
+        decision_items = [
+            item for item in results if not item["stop"] and not item["stale"] and item["above_ma20"]
+        ][:3]
+    decision_cards = "".join(_dashboard_decision_card(item) for item in decision_items)
     failures = "".join(f"<li>{html.escape(failure)}</li>" for failure in context["failures"])
     intraday = context.get("intraday_t0", [])
     holdings = context.get("holdings", [])
@@ -1128,27 +1328,38 @@ main {{ max-width:1240px; margin:0 auto; padding:32px 20px 56px; }} header {{ di
 .stamp {{ color:var(--muted); text-align:right; white-space:nowrap; }} .stats {{ display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:12px; margin-bottom:22px; }}
 .stat, .table-panel, .notes {{ background:var(--panel); border:1px solid var(--line); border-radius:8px; }} .stat {{ padding:16px; }} .stat b {{ display:block; font-size:25px; }} .stat span {{ color:var(--muted); font-size:13px; }}
 .metals-heading {{ border-left:4px solid #b7791f; background:#fffaf0; }} .metals-heading h2 {{ color:#8a5a00; }}
-.toolbar {{ display:flex; gap:10px; margin:14px 0; }} input, select {{ border:1px solid var(--line); background:#fff; border-radius:6px; padding:10px 12px; color:var(--ink); }} input {{ flex:1; min-width:160px; }}
+.section-title {{ display:flex; align-items:flex-end; justify-content:space-between; gap:16px; margin:28px 0 10px; }} .section-title h2 {{ margin:0; font-size:20px; }}
+.decision-grid {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; }} .decision-card {{ background:#fff; border:1px solid var(--line); border-top:3px solid var(--blue); border-radius:8px; padding:16px; }}
+.decision-card h3 {{ font-size:17px; line-height:1.35; margin:10px 0 14px; }} .decision-top {{ display:flex; justify-content:space-between; gap:10px; color:var(--muted); font-size:12px; }} .decision-top b {{ color:var(--blue); }}
+.decision-metrics {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; margin-bottom:12px; }} .decision-metrics span {{ color:var(--muted); font-size:11px; }} .decision-metrics strong {{ display:block; color:var(--ink); font-size:13px; }} .decision-card small {{ color:var(--muted); }}
+.lookup {{ background:#fff; border:1px solid var(--line); border-radius:8px; padding:18px; margin:22px 0; }} .lookup h2 {{ margin:0 0 4px; font-size:20px; }} .lookup-bar,.toolbar {{ display:flex; gap:10px; margin:14px 0; }} input, select, button {{ border:1px solid var(--line); background:#fff; border-radius:6px; padding:10px 12px; color:var(--ink); }} input {{ flex:1; min-width:160px; }} button {{ background:var(--ink); color:#fff; cursor:pointer; }}
+.query-result {{ display:none; border-top:1px solid var(--line); padding-top:14px; }} .query-result.visible {{ display:block; }} .query-result h3 {{ margin:0 0 8px; }} .query-grid {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }} .query-grid span {{ background:#f8fafb; padding:10px; color:var(--muted); font-size:12px; }} .query-grid b {{ display:block; color:var(--ink); font-size:14px; }} .news-list {{ margin:10px 0 0; color:var(--muted); }}
 .table-panel {{ overflow:auto; }} table {{ width:100%; border-collapse:collapse; min-width:930px; }} th,td {{ padding:12px 13px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} th {{ background:#f8fafb; color:var(--muted); font-size:12px; white-space:nowrap; }} td small {{ display:block; color:var(--muted); }} tr:last-child td {{ border-bottom:0; }}
 .positive {{ color:var(--green); font-weight:700; }} .danger {{ color:var(--red); font-weight:700; }} .neutral {{ color:#8a5a00; }} .notes {{ padding:16px; margin-top:16px; }} .notes h2 {{ font-size:16px; margin:0 0 8px; }} .notes ul {{ margin:8px 0 0; padding-left:20px; color:var(--muted); }}
-@media (max-width:700px) {{ main {{ padding:22px 12px 40px; }} header {{ display:block; }} .stamp {{ text-align:left; margin-top:10px; }} .stats {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .toolbar {{ flex-direction:column; }} }}
+@media (max-width:800px) {{ main {{ padding:22px 12px 40px; }} header {{ display:block; }} .stamp {{ text-align:left; margin-top:10px; }} .stats {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .decision-grid {{ grid-template-columns:1fr; }} .decision-metrics,.query-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .toolbar,.lookup-bar {{ flex-direction:column; }} }}
 </style></head><body><main>
 <header><div><div class="eyebrow">ETF WORKBENCH · {TOTAL_CAPITAL} CNY MODE</div><h1>{html.escape(title)}</h1><p>全市场动量、相对沪深300强弱与风险回撤的可视化筛选。</p></div><div class="stamp">更新时间<br><strong>{now:%Y-%m-%d %H:%M} 北京时间</strong></div></header>
 <section class="stats"><div class="stat"><span>当前持仓</span><b>{len(holdings)}</b></div><div class="stat"><span>已投入</span><b>{context.get('invested_amount', 0):.0f}</b></div><div class="stat"><span>剩余资金</span><b>{context.get('remaining_cash', TOTAL_CAPITAL):.0f}</b></div><div class="stat"><span>有色/稀土</span><b>{len(metals)}</b></div><div class="stat"><span>有效标的</span><b>{len(results)}</b></div></section>
+<div class="section-title"><div><h2>今天先看这里</h2><p>按操作优先级展示；没有通过全部门槛时只给观察项，不强行凑买入建议。</p></div></div>
+<section class="decision-grid">{decision_cards or '<article class="decision-card"><h3>今天没有通过全部门槛的候选</h3><p>保留现金，不为了目标涨幅强行交易。</p></article>'}</section>
+<section class="lookup"><h2>查一只基金</h2><p>输入本次已扫描的基金代码或名称，立即查看金额、计划持有期、经理经验、次日情景和风险依据。</p><div class="lookup-bar"><input id="fund-query" type="search" inputmode="search" placeholder="例如：004433 或 南方有色"><button id="query-button" type="button">查询</button></div><div id="query-result" class="query-result" aria-live="polite"></div></section>
 <section class="notes"><h2>我的持仓与最新操作建议</h2><p>操作建议依据最新可用净值、均线、动量、回撤和赎回费期限生成；待确认订单不重复加仓。</p></section>
 <section class="table-panel"><table><thead><tr><th>持有基金</th><th>买入时间</th><th>金额</th><th>状态</th><th>最新净值</th><th>趋势</th><th>20日回撤</th><th>持仓收益</th><th>当前操作</th></tr></thead><tbody>{holding_rows or '<tr><td colspan="9">尚未录入持仓。</td></tr>'}</tbody></table></section>
 <section class="notes metals-heading" id="metals"><h2>有色金属与稀土专区</h2><p>已固定跟踪支付宝场外联接基金和场内 ETF。按 1/3/5 日短动量排序，动作仍受均线、回撤、赎回费和场内佣金约束。</p></section>
-<section class="table-panel"><table><thead><tr><th>有色/稀土标的</th><th>数据日期</th><th>1日</th><th>3日</th><th>5日</th><th>7日短动量</th><th>MA20 / MA60</th><th>当前动作</th></tr></thead><tbody>{metals_rows or '<tr><td colspan="8">本次有色金属数据获取失败，已保留标的并等待下次重试。</td></tr>'}</tbody></table></section>
+<section class="table-panel"><table><thead><tr><th>有色/稀土标的</th><th>数据日期</th><th>1日</th><th>3日</th><th>5日</th><th>7日短动量</th><th>MA20 / MA60</th><th>基金经理</th><th>次日情景区间</th><th>当前动作</th></tr></thead><tbody>{metals_rows or '<tr><td colspan="10">本次有色金属数据获取失败，已保留标的并等待下次重试。</td></tr>'}</tbody></table></section>
 <section class="notes"><h2>{TARGET_DAILY_MOVE:.1f}%+ 七日高弹性候选</h2><p>按 1/3/5 日短动量筛选，计划最长持有 {MAX_PLANNED_HOLD_DAYS} 天；只有最新 1 日涨幅 ≥{TARGET_DAILY_MOVE:.1f}% 且趋势通过的标的才可能进入买入观察。</p></section>
 <div class="toolbar"><input id="search" type="search" placeholder="搜索名称或代码"><select id="kind"><option value="all">全部标的</option><option value="alipay_a">支付宝 A 类</option><option value="alipay_c">支付宝 C 类</option><option value="linked_c">自动匹配 C 类</option><option value="etf">场内 ETF</option></select></div>
-<section class="table-panel"><table><thead><tr><th>排名</th><th>标的</th><th>数据日期</th><th>最新1日</th><th>20日最大单日涨幅</th><th>7日短动量</th><th>池内分位</th><th>20日收益 / RS</th><th>MA20 / MA60</th><th>20日回撤</th><th>动作与依据</th></tr></thead><tbody id="rows">{rows}</tbody></table></section>
+<section class="table-panel"><table><thead><tr><th>排名</th><th>标的</th><th>数据日期</th><th>最新1日</th><th>20日最大单日涨幅</th><th>7日短动量</th><th>池内分位</th><th>20日收益 / RS</th><th>MA20 / MA60</th><th>基金经理</th><th>次日情景区间</th><th>20日回撤</th><th>动作与依据</th></tr></thead><tbody id="rows">{rows}</tbody></table></section>
 <section class="notes"><h2>T+0 日内盈利可执行性</h2><p>仅列出规则允许当日回转的代表性债券、黄金和跨境 ETF。成本门槛通过不等于盈利预测；回本涨幅还未计买卖价差、滑点和溢价风险。</p></section>
 <section class="table-panel"><table><thead><tr><th>T+0 标的</th><th>现价</th><th>当日涨跌</th><th>1 手金额</th><th>最多成交</th><th>佣金回本涨幅</th><th>结论</th></tr></thead><tbody>{intraday_rows or '<tr><td colspan="7">本次未获取到可核验的 T+0 行情。</td></tr>'}</tbody></table></section>
 <section class="notes"><h2>风控与数据状态</h2><p>总资金 {TOTAL_CAPITAL} 元，单笔加仓控制在 {BUY_MIN}～{BUY_MAX} 元。场内 ETF 按买卖各最低 {BROKER_MIN_COMMISSION:.0f} 元佣金过滤，往返成本超过 {MAX_EXCHANGE_ROUND_TRIP_COST_PCT:.1f}% 时只观察；支付宝 C 类按实时赎回费率给出最低计划持有天数，最终以购买页为准。</p>{f'<ul>{failures}</ul>' if failures else '<p>本次扫描未记录接口失败。</p>'}</section>
 <script type="application/json" id="dashboard-data">{data_json}</script><script>
-const data=JSON.parse(document.getElementById('dashboard-data').textContent); const search=document.getElementById('search'); const kind=document.getElementById('kind');
+const data=JSON.parse(document.getElementById('dashboard-data').textContent); const search=document.getElementById('search'); const kind=document.getElementById('kind'); const fundQuery=document.getElementById('fund-query'); const queryButton=document.getElementById('query-button'); const queryResult=document.getElementById('query-result');
 function filterRows(){{const q=search.value.trim().toLowerCase(), k=kind.value; document.querySelectorAll('#rows tr').forEach(row=>{{const text=row.textContent.toLowerCase(); row.hidden=(q&&!text.includes(q))||(k!=='all'&&row.dataset.kind!==k);}});}}
 search.addEventListener('input',filterRows); kind.addEventListener('change',filterRows);
+function addText(parent,tag,text,className){{const node=document.createElement(tag); node.textContent=text; if(className)node.className=className; parent.appendChild(node); return node;}}
+function runQuery(){{const q=fundQuery.value.trim().toLowerCase(); queryResult.replaceChildren(); queryResult.classList.add('visible'); if(!q){{addText(queryResult,'p','请输入基金代码或名称。'); return;}} const matches=data.results.filter(item=>item.code.toLowerCase()===q||item.name.toLowerCase().includes(q)); if(!matches.length){{addText(queryResult,'h3','本次扫描池中没有找到'); addText(queryResult,'p','请把基金代码发给我，我可以先核验代码、费率和数据，再决定是否加入固定扫描池。'); return;}} const item=matches[0]; addText(queryResult,'h3',item.code+' · '+item.name); const grid=addText(queryResult,'div','', 'query-grid'); const holding=item.fee_free_days?('至少 '+item.fee_free_days+' 天'):(item.kind==='etf'?'1～7 天复核':'赎回前核对费率'); const manager=item.manager_years!=null?(item.manager_names+' · '+item.manager_years.toFixed(1)+' 年'):'待核验'; [['当前结论',item.action],['建议金额',(item.amount||0)+' 元'],['计划持有',holding],['基金经理',manager],['1/3/5日',item.r1.toFixed(2)+'% / '+item.r3.toFixed(2)+'% / '+item.r5.toFixed(2)+'%'],['次日情景',item.next_day_low.toFixed(2)+'% ～ '+item.next_day_high.toFixed(2)+'%'],['置信度',item.forecast_confidence],['数据日期',item.data_date]].forEach(pair=>{{const box=addText(grid,'span',pair[0]); addText(box,'b',pair[1]);}}); addText(queryResult,'p','提示：情景区间由近期波动、趋势和有限新闻标题估算，不是收益承诺。'); if(item.news_titles&&item.news_titles.length){{const list=addText(queryResult,'ul','', 'news-list'); item.news_titles.forEach(title=>addText(list,'li',title));}}}}
+queryButton.addEventListener('click',runQuery); fundQuery.addEventListener('keydown',event=>{{if(event.key==='Enter')runQuery();}});
 </script></main></body></html>'''
 
 
