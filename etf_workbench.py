@@ -966,6 +966,28 @@ def _dashboard_row(item: dict[str, Any]) -> str:
     )
 
 
+def _dashboard_holding_row(position: dict[str, Any]) -> str:
+    item = position.get("analysis")
+    status = "待确认" if position["status"] == "pending" else "已确认"
+    trend = "行情暂缺"
+    latest = "--"
+    drawdown = "--"
+    if item:
+        trend = f"MA20 {'上方' if item['above_ma20'] else '下方'} / MA60 {'上方' if item['above_ma60'] else '下方'}"
+        latest = f"{item['latest']:.4f}"
+        drawdown = f"{item['drawdown']:.2f}%"
+    current_return = position.get("current_return")
+    return_text = f"{current_return:.2f}%" if current_return is not None else "待补成交净值"
+    return (
+        "<tr>"
+        f"<td><strong>{html.escape(position['name'])}</strong><small>{html.escape(position['code'])}</small></td>"
+        f"<td>{html.escape(position['buy_date'])}<small>{html.escape(position.get('buy_time', ''))}</small></td>"
+        f"<td>{position['amount']:.0f} 元</td><td>{status}</td><td>{latest}</td>"
+        f"<td>{html.escape(trend)}</td><td>{drawdown}</td><td>{return_text}</td>"
+        f"<td class='neutral'><strong>{html.escape(position['advice'])}</strong></td></tr>"
+    )
+
+
 def build_dashboard(context: dict[str, Any], title: str) -> str:
     now: datetime = context["now"]
     results = context["results"]
@@ -977,12 +999,17 @@ def build_dashboard(context: dict[str, Any], title: str) -> str:
         "watch_count": context["watch_count"],
         "results": results,
         "intraday_t0": context.get("intraday_t0", []),
+        "holdings": context.get("holdings", []),
+        "invested_amount": context.get("invested_amount", 0),
+        "remaining_cash": context.get("remaining_cash", TOTAL_CAPITAL),
         "failures": context["failures"],
     }
     data_json = json.dumps(payload, ensure_ascii=False, default=str).replace("</", "<\\/")
     rows = "".join(_dashboard_row(item) for item in results)
     failures = "".join(f"<li>{html.escape(failure)}</li>" for failure in context["failures"])
     intraday = context.get("intraday_t0", [])
+    holdings = context.get("holdings", [])
+    holding_rows = "".join(_dashboard_holding_row(position) for position in holdings)
     intraday_rows = "".join(
         f"<tr><td><strong>{html.escape(item['name'])}</strong><small>{item['code']} · {item['category']}</small></td>"
         f"<td>{item['price']:.3f}</td><td>{item['change']:.2f}%</td><td>{item['lot_cost']:.0f} 元</td>"
@@ -999,7 +1026,7 @@ def build_dashboard(context: dict[str, Any], title: str) -> str:
 * {{ box-sizing:border-box; }} body {{ margin:0; background:var(--bg); color:var(--ink); font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif; }}
 main {{ max-width:1240px; margin:0 auto; padding:32px 20px 56px; }} header {{ display:flex; justify-content:space-between; gap:24px; align-items:flex-end; margin-bottom:24px; }}
 .eyebrow {{ color:var(--blue); font-size:12px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }} h1 {{ margin:5px 0 4px; font-size:clamp(26px,4vw,42px); line-height:1.15; }} p {{ margin:0; color:var(--muted); }}
-.stamp {{ color:var(--muted); text-align:right; white-space:nowrap; }} .stats {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin-bottom:22px; }}
+.stamp {{ color:var(--muted); text-align:right; white-space:nowrap; }} .stats {{ display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:12px; margin-bottom:22px; }}
 .stat, .table-panel, .notes {{ background:var(--panel); border:1px solid var(--line); border-radius:8px; }} .stat {{ padding:16px; }} .stat b {{ display:block; font-size:25px; }} .stat span {{ color:var(--muted); font-size:13px; }}
 .toolbar {{ display:flex; gap:10px; margin:14px 0; }} input, select {{ border:1px solid var(--line); background:#fff; border-radius:6px; padding:10px 12px; color:var(--ink); }} input {{ flex:1; min-width:160px; }}
 .table-panel {{ overflow:auto; }} table {{ width:100%; border-collapse:collapse; min-width:930px; }} th,td {{ padding:12px 13px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} th {{ background:#f8fafb; color:var(--muted); font-size:12px; white-space:nowrap; }} td small {{ display:block; color:var(--muted); }} tr:last-child td {{ border-bottom:0; }}
@@ -1007,7 +1034,10 @@ main {{ max-width:1240px; margin:0 auto; padding:32px 20px 56px; }} header {{ di
 @media (max-width:700px) {{ main {{ padding:22px 12px 40px; }} header {{ display:block; }} .stamp {{ text-align:left; margin-top:10px; }} .stats {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .toolbar {{ flex-direction:column; }} }}
 </style></head><body><main>
 <header><div><div class="eyebrow">ETF WORKBENCH · {TOTAL_CAPITAL} CNY MODE</div><h1>{html.escape(title)}</h1><p>全市场动量、相对沪深300强弱与风险回撤的可视化筛选。</p></div><div class="stamp">更新时间<br><strong>{now:%Y-%m-%d %H:%M} 北京时间</strong></div></header>
-<section class="stats"><div class="stat"><span>有效标的</span><b>{len(results)}</b></div><div class="stat"><span>动态扫描 ETF</span><b>{context['dynamic_count']}</b></div><div class="stat"><span>买入观察</span><b>{sum(item['action'] == '买入观察' for item in results)}</b></div><div class="stat"><span>触发风控</span><b>{sum(item['stop'] for item in results)}</b></div></section>
+<section class="stats"><div class="stat"><span>当前持仓</span><b>{len(holdings)}</b></div><div class="stat"><span>已投入</span><b>{context.get('invested_amount', 0):.0f}</b></div><div class="stat"><span>剩余资金</span><b>{context.get('remaining_cash', TOTAL_CAPITAL):.0f}</b></div><div class="stat"><span>有效标的</span><b>{len(results)}</b></div><div class="stat"><span>触发风控</span><b>{sum(item['stop'] for item in results)}</b></div></section>
+<section class="notes"><h2>我的持仓与最新操作建议</h2><p>操作建议依据最新可用净值、均线、动量、回撤和赎回费期限生成；待确认订单不重复加仓。</p></section>
+<section class="table-panel"><table><thead><tr><th>持有基金</th><th>买入时间</th><th>金额</th><th>状态</th><th>最新净值</th><th>趋势</th><th>20日回撤</th><th>持仓收益</th><th>当前操作</th></tr></thead><tbody>{holding_rows or '<tr><td colspan="9">尚未录入持仓。</td></tr>'}</tbody></table></section>
+<section class="notes"><h2>全市场最新候选与交易操作</h2><p>进攻档优先展示短期动量和相对强度靠前的标的；候选榜不等同于必须买入。</p></section>
 <div class="toolbar"><input id="search" type="search" placeholder="搜索名称或代码"><select id="kind"><option value="all">全部标的</option><option value="alipay_a">支付宝 A 类</option><option value="alipay_c">支付宝 C 类</option><option value="linked_c">自动匹配 C 类</option><option value="etf">场内 ETF</option></select></div>
 <section class="table-panel"><table><thead><tr><th>排名</th><th>标的</th><th>数据日期</th><th>动量得分</th><th>池内分位</th><th>20日收益 / RS</th><th>MA20 / MA60</th><th>20日回撤</th><th>动作与依据</th></tr></thead><tbody id="rows">{rows}</tbody></table></section>
 <section class="notes"><h2>T+0 日内盈利可执行性</h2><p>仅列出规则允许当日回转的代表性债券、黄金和跨境 ETF。成本门槛通过不等于盈利预测；回本涨幅还未计买卖价差、滑点和溢价风险。</p></section>
