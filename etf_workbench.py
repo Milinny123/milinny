@@ -23,7 +23,7 @@ HISTORY_ROWS = 150
 RISK_PROFILE = os.getenv("RISK_PROFILE", "aggressive").strip().lower()
 if RISK_PROFILE not in {"balanced", "aggressive"}:
     RISK_PROFILE = "aggressive"
-MAX_DYNAMIC_CANDIDATES = 24 if RISK_PROFILE == "aggressive" else 12
+MAX_DYNAMIC_CANDIDATES = 18 if RISK_PROFILE == "aggressive" else 12
 MAX_LINKED_FUNDS = 10
 MAX_REPORT_ITEMS = 12
 MAX_DRAWDOWN_LIMIT = -8.0
@@ -178,7 +178,7 @@ class _AkshareTimeout(TimeoutError):
     """Raised when an external AkShare request exceeds the per-call limit."""
 
 
-def _ak_call(func: Callable[[], Any], seconds: int = 20) -> Any:
+def _ak_call(func: Callable[[], Any], seconds: int = 10) -> Any:
     """Run one network-backed AkShare call with a hard timeout on Linux runners."""
     if not hasattr(signal, "SIGALRM"):
         return func()
