@@ -8,7 +8,7 @@
       "buy_time": "14:08:12",
       "amount": 100,
       "cost_nav": null,
-      "status": "pending"
+      "status": "confirmed"
     },
     {
       "code": "012349",
@@ -18,7 +18,7 @@
       "buy_time": "14:06:40",
       "amount": 100,
       "cost_nav": null,
-      "status": "pending"
+      "status": "confirmed"
     },
     {
       "code": "007467",
@@ -28,7 +28,7 @@
       "buy_time": "14:05:39",
       "amount": 100,
       "cost_nav": null,
-      "status": "pending"
+      "status": "confirmed"
     },
     {
       "code": "006381",
@@ -38,7 +38,7 @@
       "buy_time": "14:04:24",
       "amount": 100,
       "cost_nav": null,
-      "status": "pending"
+      "status": "confirmed"
     },
     {
       "code": "006328",
@@ -48,7 +48,7 @@
       "buy_time": "14:03:24",
       "amount": 150,
       "cost_nav": null,
-      "status": "pending"
+      "status": "confirmed"
     },
     {
       "code": "014674",
