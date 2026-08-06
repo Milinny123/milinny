@@ -97,16 +97,14 @@ _FUND_ESTIMATION_CACHE: dict[str, dict[str, Any]] | None = None
 # Codes are checked against AKShare's fund catalog at runtime.  The catalog is
 # authoritative for the current name; an invalid or mismatched entry is skipped.
 CORE_WATCHLIST: list[dict[str, Any]] = [
-    {"code": "012616", "name": "华夏半导体芯片ETF联接C", "kind": "alipay_c", "data_codes": ("012616",)},
     {"code": "008888", "name": "华夏国证半导体芯片ETF联接C", "kind": "alipay_c", "data_codes": ("008888",)},
     {"code": "011613", "name": "华夏科创50ETF联接C", "kind": "alipay_c", "data_codes": ("011613",)},
-    {"code": "015874", "name": "富国中证人工智能ETF联接C", "kind": "alipay_c", "data_codes": ("015874",)},
+    {"code": "008586", "name": "华夏人工智能ETF联接C", "kind": "alipay_c", "data_codes": ("008586",)},
     {"code": "024663", "name": "富国创业板人工智能ETF发起式联接C", "kind": "alipay_c", "data_codes": ("024663",)},
-    {"code": "017415", "name": "北证50ETF联接C", "kind": "alipay_c", "data_codes": ("017415",)},
-    {"code": "013181", "name": "动漫游戏ETF联接C", "kind": "alipay_c", "data_codes": ("013181",)},
-    {"code": "017186", "name": "机器人ETF联接C", "kind": "alipay_c", "data_codes": ("017186",)},
-    {"code": "012303", "name": "港股科技ETF联接(QDII)C", "kind": "alipay_c", "data_codes": ("012303",)},
-    {"code": "018326", "name": "中证2000ETF联接C", "kind": "alipay_c", "data_codes": ("018326",)},
+    {"code": "017516", "name": "易方达北证50成份指数C", "kind": "alipay_c", "data_codes": ("017516",)},
+    {"code": "020973", "name": "易方达机器人ETF联接C", "kind": "alipay_c", "data_codes": ("020973",)},
+    {"code": "012805", "name": "广发恒生科技ETF联接(QDII)C", "kind": "alipay_c", "data_codes": ("012805",)},
+    {"code": "019892", "name": "华夏中证2000ETF发起式联接C", "kind": "alipay_c", "data_codes": ("019892",)},
     {"code": "016008", "name": "招商中证消费电子主题ETF联接C", "kind": "alipay_c", "data_codes": ("016008",)},
     {"code": "017938", "name": "易方达中证医疗ETF联接发起式C", "kind": "alipay_c", "data_codes": ("017938",)},
     {"code": "006328", "name": "易方达中证海外互联网50ETF联接(QDII)C", "kind": "alipay_c", "data_codes": ("006328",)},
