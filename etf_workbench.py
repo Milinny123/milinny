@@ -66,6 +66,9 @@ TARGET_DAILY_MOVE = _non_negative_float_env("TARGET_DAILY_MOVE", 3.0)
 ENTRY_MAX_DAILY_MOVE = _non_negative_float_env("ENTRY_MAX_DAILY_MOVE", 2.5)
 ENTRY_MIN_DAILY_MOVE = -_non_negative_float_env("ENTRY_PULLBACK_LIMIT", 2.5)
 MIN_BACKTEST_SIGNALS = _positive_int_env("MIN_BACKTEST_SIGNALS", 8)
+# Master prompt's intraday burst score.  est_growth is an estimate, so the
+# report always exposes its source and falls back to the latest daily return.
+BURST_WEIGHTS = (0.45, 0.30, 0.15, 0.10)
 MOMENTUM_WEIGHTS = (0.65, 0.25, 0.10) if RISK_PROFILE == "aggressive" else (0.50, 0.30, 0.20)
 SHORT_MOMENTUM_WEIGHTS = (0.45, 0.30, 0.25)
 MAX_PLANNED_HOLD_DAYS = _positive_int_env("MAX_PLANNED_HOLD_DAYS", 7)
@@ -89,13 +92,21 @@ T0_ETF_ALLOWLIST: dict[str, dict[str, str]] = {
 }
 
 _ETF_SPOT_CACHE: pd.DataFrame | None = None
+_FUND_ESTIMATION_CACHE: dict[str, dict[str, Any]] | None = None
 
-# 场外基金代码已按基金管理人官网/产品资料核验；代码与名称不得分离修改。
+# Codes are checked against AKShare's fund catalog at runtime.  The catalog is
+# authoritative for the current name; an invalid or mismatched entry is skipped.
 CORE_WATCHLIST: list[dict[str, Any]] = [
+    {"code": "012616", "name": "华夏半导体芯片ETF联接C", "kind": "alipay_c", "data_codes": ("012616",)},
     {"code": "008888", "name": "华夏国证半导体芯片ETF联接C", "kind": "alipay_c", "data_codes": ("008888",)},
     {"code": "011613", "name": "华夏科创50ETF联接C", "kind": "alipay_c", "data_codes": ("011613",)},
+    {"code": "015874", "name": "富国中证人工智能ETF联接C", "kind": "alipay_c", "data_codes": ("015874",)},
     {"code": "024663", "name": "富国创业板人工智能ETF发起式联接C", "kind": "alipay_c", "data_codes": ("024663",)},
-    {"code": "007339", "name": "易方达沪深300ETF联接C", "kind": "alipay_c", "data_codes": ("007339",)},
+    {"code": "017415", "name": "北证50ETF联接C", "kind": "alipay_c", "data_codes": ("017415",)},
+    {"code": "013181", "name": "动漫游戏ETF联接C", "kind": "alipay_c", "data_codes": ("013181",)},
+    {"code": "017186", "name": "机器人ETF联接C", "kind": "alipay_c", "data_codes": ("017186",)},
+    {"code": "012303", "name": "港股科技ETF联接(QDII)C", "kind": "alipay_c", "data_codes": ("012303",)},
+    {"code": "018326", "name": "中证2000ETF联接C", "kind": "alipay_c", "data_codes": ("018326",)},
     {"code": "016008", "name": "招商中证消费电子主题ETF联接C", "kind": "alipay_c", "data_codes": ("016008",)},
     {"code": "017938", "name": "易方达中证医疗ETF联接发起式C", "kind": "alipay_c", "data_codes": ("017938",)},
     {"code": "006328", "name": "易方达中证海外互联网50ETF联接(QDII)C", "kind": "alipay_c", "data_codes": ("006328",)},
@@ -109,6 +120,7 @@ CORE_WATCHLIST: list[dict[str, Any]] = [
     {"code": "017193", "name": "天弘中证工业有色金属主题ETF发起联接C", "kind": "alipay_c", "data_codes": ("017193",)},
     {"code": "018168", "name": "国泰有色矿业ETF联接C", "kind": "alipay_c", "data_codes": ("018168",)},
     {"code": "011036", "name": "嘉实中证稀土产业ETF联接C", "kind": "alipay_c", "data_codes": ("011036",)},
+    {"code": "007339", "name": "易方达沪深300ETF联接C", "kind": "alipay_c", "data_codes": ("007339",)},
     {"code": "588000", "name": "科创50ETF", "kind": "etf", "data_codes": ("588000",)},
     {"code": "512480", "name": "半导体ETF", "kind": "etf", "data_codes": ("512480",)},
     {"code": "512400", "name": "有色金属ETF南方", "kind": "etf", "data_codes": ("512400",)},
@@ -314,6 +326,69 @@ def _etf_spot() -> pd.DataFrame:
             raise ValueError("全市场 ETF 实时行情为空")
         _ETF_SPOT_CACHE = frame
     return _ETF_SPOT_CACHE.copy()
+
+
+def _percent_number(value: Any) -> float | None:
+    number = pd.to_numeric(str(value).replace("%", "").replace(",", ""), errors="coerce")
+    return None if pd.isna(number) else float(number)
+
+
+def fund_intraday_estimations(failures: list[str]) -> dict[str, dict[str, Any]]:
+    """Fetch Eastmoney intraday NAV estimates once and index them by fund code."""
+    global _FUND_ESTIMATION_CACHE
+    if _FUND_ESTIMATION_CACHE is not None:
+        return _FUND_ESTIMATION_CACHE
+    try:
+        frame = _ak_call(lambda: ak.fund_value_estimation_em(symbol="全部"), seconds=20)
+        if frame is None or frame.empty:
+            raise ValueError("净值估算接口返回空数据")
+        code_col = _first_existing(frame, ("基金代码", "代码", "fund_code"))
+        name_col = _first_existing(frame, ("基金名称", "基金简称", "名称"))
+        growth_col = next((col for col in frame.columns if "估算增长率" in str(col)), None)
+        value_col = next((col for col in frame.columns if "估算值" in str(col)), None)
+        if not code_col or not growth_col:
+            raise ValueError(f"净值估算字段不完整: {list(frame.columns)}")
+        estimates: dict[str, dict[str, Any]] = {}
+        for _, row in frame.iterrows():
+            code_match = re.search(r"\d{6}", str(row[code_col]))
+            growth = _percent_number(row[growth_col])
+            if not code_match or growth is None:
+                continue
+            code = code_match.group(0)
+            estimates[code] = {
+                "est_growth": growth,
+                "est_value": _percent_number(row[value_col]) if value_col else None,
+                "est_name": str(row[name_col]).strip() if name_col else "",
+                "est_column": str(growth_col),
+            }
+        if not estimates:
+            raise ValueError("净值估算接口未解析出有效记录")
+        _FUND_ESTIMATION_CACHE = estimates
+        return estimates
+    except Exception as exc:
+        failures.append(f"盘中净值估算：{_short_error(exc)}；本次使用最新日收益替代并明确标注")
+        _FUND_ESTIMATION_CACHE = {}
+        return {}
+
+
+def _sector_name(name: str) -> str:
+    groups = (
+        (("半导体", "芯片"), "半导体"),
+        (("人工智能", "AI", "算力", "软件", "机器人"), "AI / 科技"),
+        (("动漫", "游戏"), "游戏传媒"),
+        (("北证", "中证2000", "微盘"), "小微盘"),
+        (("恒生", "港股", "互联网", "海外"), "港股 / QDII"),
+        (("有色", "稀土", "矿业"), "有色金属"),
+        (("科创50",), "科创50"),
+        (("医疗", "医药"), "医疗"),
+        (("消费电子",), "消费电子"),
+        (("证券", "券商"), "证券"),
+        (("黄金",), "黄金"),
+    )
+    for words, sector in groups:
+        if any(word in name for word in words):
+            return sector
+    return "其他"
 
 
 def scan_market_etfs() -> list[dict[str, Any]]:
@@ -624,7 +699,10 @@ def _rolling_entry_backtest(close: pd.Series) -> dict[str, Any]:
 
 
 def analyse_item(
-    item: dict[str, Any], benchmark_returns: dict[int, float], as_of: datetime
+    item: dict[str, Any],
+    benchmark_returns: dict[int, float],
+    as_of: datetime,
+    intraday_estimations: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     history, data_code, source = fetch_item_history(item)
     if len(history) < 61:
@@ -647,6 +725,15 @@ def analyse_item(
         + returns[20] * MOMENTUM_WEIGHTS[1]
         + returns[60] * MOMENTUM_WEIGHTS[2]
     )
+    estimation = (intraday_estimations or {}).get(item["code"], {})
+    est_growth = estimation.get("est_growth")
+    intraday_growth = returns[1] if est_growth is None else float(est_growth)
+    burst_score = (
+        intraday_growth * BURST_WEIGHTS[0]
+        + returns[3] * BURST_WEIGHTS[1]
+        + returns[5] * BURST_WEIGHTS[2]
+        + returns[20] * BURST_WEIGHTS[3]
+    )
     short_score = (
         returns[1] * SHORT_MOMENTUM_WEIGHTS[0]
         + returns[3] * SHORT_MOMENTUM_WEIGHTS[1]
@@ -668,8 +755,14 @@ def analyse_item(
         "r20": returns[20],
         "r60": returns[60],
         "score": score,
+        "est_growth": est_growth,
+        "est_value": estimation.get("est_value"),
+        "est_source": "东方财富盘中净值估算" if est_growth is not None else "最新日收益回退",
+        "intraday_growth": intraday_growth,
+        "burst_score": burst_score,
         "short_score": short_score,
-        "selection_score": short_score if RISK_PROFILE == "aggressive" else score,
+        "selection_score": burst_score if RISK_PROFILE == "aggressive" else score,
+        "sector": _sector_name(item["name"]),
         "ma20": ma20,
         "ma60": ma60,
         "above_ma20": latest >= ma20,
@@ -737,11 +830,11 @@ def _rank_results(results: list[dict[str, Any]]) -> None:
                 item["action"] = "持有/观察" if item["above_ma20"] else "暂缓/观望"
                 item["amount"] = 0
                 continue
-            if item["r1"] > ENTRY_MAX_DAILY_MOVE:
+            if item["intraday_growth"] > ENTRY_MAX_DAILY_MOVE:
                 item["action"] = "等待回踩"
                 item["amount"] = 0
                 continue
-            if item["r1"] < ENTRY_MIN_DAILY_MOVE:
+            if item["intraday_growth"] < ENTRY_MIN_DAILY_MOVE:
                 item["action"] = "下跌未止"
                 item["amount"] = 0
                 continue
@@ -1115,6 +1208,7 @@ def analyse_market(now: datetime | None = None) -> dict[str, Any]:
         holdings = []
         failures.append(f"持仓文件：{_short_error(exc)}")
     watchlist, dynamic_count = build_watchlist(failures, holdings)
+    intraday_estimations = fund_intraday_estimations(failures)
     benchmark_returns: dict[int, float] = {}
     benchmark_date = ""
     try:
@@ -1132,7 +1226,7 @@ def analyse_market(now: datetime | None = None) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     for item in watchlist:
         try:
-            results.append(analyse_item(item, benchmark_returns, now))
+            results.append(analyse_item(item, benchmark_returns, now, intraday_estimations))
         except Exception as exc:
             failures.append(f"{item['code']} {item['name']}：{_short_error(exc)}")
     _rank_results(results)
@@ -1154,6 +1248,7 @@ def analyse_market(now: datetime | None = None) -> dict[str, Any]:
         "watch_count": len(watchlist),
         "benchmark_returns": benchmark_returns,
         "benchmark_date": benchmark_date,
+        "intraday_estimation_count": len(intraday_estimations),
         "intraday_t0": intraday_t0,
         "holdings": enriched_holdings,
         "invested_amount": invested_amount,
@@ -1188,11 +1283,11 @@ def _action_text(item: dict[str, Any]) -> str:
         )
     if item["action"] == "等待回踩":
         return (
-            f"短线已上涨 {item['r1']:.2f}%，避免追涨；回落至 MA20 附近且趋势未破坏时，"
+            f"盘中估算已上涨 {item['intraday_growth']:.2f}%，避免追涨；回落至 MA20 附近且趋势未破坏时，"
             f"再考虑 {STANDARD_BUY} 元试仓"
         )
     if item["action"] == "下跌未止":
-        return f"最新1日 {item['r1']:.2f}% 且仍弱于入场区间，先等止跌，不接 falling knife"
+        return f"盘中估算 {item['intraday_growth']:.2f}% 且仍弱于入场区间，先等止跌，不接连续下跌"
     if item["action"] == "回测不支持":
         return (
             f"历史同规则样本 {item['backtest_signals']} 次，3/5日胜率或平均收益未达门槛，"
@@ -1233,10 +1328,11 @@ def _line(item: dict[str, Any]) -> str:
         else "基金经理年限待核验"
     )
     return (
-        f"- **{item['code']} {item['name']}**（{item['kind']}）：1/3/5/20/60日 "
+        f"- **{item['code']} {item['name']}**（{item['sector']} / {item['kind']}）：盘中估算 "
+        f"**{item['intraday_growth']:.2f}%**（{item['est_source']}），爆发得分 **{item['burst_score']:.2f}**；1/3/5/20/60日 "
         f"{item['r1']:.2f}% / {item['r3']:.2f}% / {item['r5']:.2f}% / {item['r20']:.2f}% / {item['r60']:.2f}%，"
         f"近20日最大单日上涨 **{item['max_daily_gain20']:.2f}%**（≥{TARGET_DAILY_MOVE:.1f}% 共 {item['target_move_days20']} 次），"
-        f"日波动率 {item['daily_volatility20']:.2f}%，7日短动量 **{item['short_score']:.2f}**，"
+        f"日波动率 {item['daily_volatility20']:.2f}%，"
         f"池内分位 **{item['pool_percentile']:.1f}%**（约前 {item['pool_top_percent']}%）；"
         f"数据日期 {item['data_date']}，{trend}，相对沪深300超额20/60日 {item['rs20']:.2f}% / {item['rs60']:.2f}%，"
         f"回撤 {item['drawdown']:.2f}%；{manager}；次日情景区间 "
@@ -1361,8 +1457,9 @@ def build_report(context: dict[str, Any]) -> tuple[str, str]:
         "**支付宝 C 类风控：** 不同基金赎回费规则不同；脚本会实时核验出现买入信号的基金，必须按报告给出的免赎回费持有期限执行，并以支付宝购买页为最终依据。",
         "",
         f"**7日纪律：** 计划最长持有 {MAX_PLANNED_HOLD_DAYS} 天；场外基金只有免赎回费期限不超过该计划时才允许出现买入信号，到期必须复核。",
-        f"**风险提示：** 当前为{'进攻' if RISK_PROFILE == 'aggressive' else '均衡'}档，1/3/5日短动量权重为 45%/30%/25%，可能带来更大回撤；不代表收益预测。",
-        f"**入场规则：** 最新1日涨幅高于 {ENTRY_MAX_DAILY_MOVE:.1f}% 视为过热并等待回踩，不再把单日大涨当作买点。",
+        f"**风险提示：** 当前为{'进攻' if RISK_PROFILE == 'aggressive' else '均衡'}档，爆发得分按盘中估算/3日/5日/20日 45%/30%/15%/10% 计算，可能带来更大回撤；不代表收益预测。",
+        f"**估值说明：** 本次盘中估值覆盖 {context.get('intraday_estimation_count', 0)} 只基金；没有估值的标的使用最新日收益回退并明确标注。",
+        f"**入场规则：** 盘中估算涨幅高于 {ENTRY_MAX_DAILY_MOVE:.1f}% 视为过热并等待回踩，不再把单日大涨当作买点。",
         "**回测说明：** 胜率和平均收益来自近150条净值/行情的滚动历史样本，不含未来数据，但仍可能过拟合且不代表未来。",
         "**免责声明：** 本报告由量化脚本自动生成，仅供研究参考，不构成投资建议。",
     ]
@@ -1380,11 +1477,12 @@ def _dashboard_row(item: dict[str, Any]) -> str:
     }.get(item["kind"], item["kind"])
     action_class = "danger" if item["stop"] else ("positive" if item["action"] == "买入观察" else "neutral")
     return (
-        f"<tr data-kind='{html.escape(item['kind'])}'><td>{item['rank']}</td>"
-        f"<td><strong>{html.escape(item['name'])}</strong><small>{html.escape(item['code'])} · {kind_label}</small></td>"
+        f"<tr data-kind='{html.escape(item['kind'])}' data-sector='{html.escape(item['sector'])}'><td>{item['rank']}</td>"
+        f"<td><strong>{html.escape(item['name'])}</strong><small>{html.escape(item['code'])} · {kind_label} · {html.escape(item['sector'])}</small></td>"
         f"<td>{html.escape(item['data_date'])}</td>"
+        f"<td>{item['intraday_growth']:.2f}%<small>{html.escape(item['est_source'])}</small></td>"
         f"<td>{item['r1']:.2f}%</td><td>{item['max_daily_gain20']:.2f}%<small>达标 {item['target_move_days20']} 次</small></td>"
-        f"<td>{item['short_score']:.2f}</td><td>{item['pool_percentile']:.1f}%</td>"
+        f"<td>{item['burst_score']:.2f}</td><td>{item['pool_percentile']:.1f}%</td>"
         f"<td>{item['r20']:.2f}%<br><small>RS {item['rs20']:.2f}%</small></td>"
         f"<td>{'是' if item['above_ma20'] else '否'} / {'是' if item['above_ma60'] else '否'}</td>"
         f"<td>{html.escape(item.get('manager_names', '待核验'))}<small>{html.escape(_manager_years_text(item))}</small></td>"
@@ -1432,8 +1530,8 @@ def _dashboard_metals_row(item: dict[str, Any]) -> str:
         "<tr>"
         f"<td><strong>{html.escape(item['name'])}</strong><small>{html.escape(item['code'])} · {kind_label}</small></td>"
         f"<td>{html.escape(item['data_date'])}</td>"
-        f"<td>{item['r1']:.2f}%</td><td>{item['r3']:.2f}%</td><td>{item['r5']:.2f}%</td>"
-        f"<td>{item['short_score']:.2f}</td>"
+        f"<td>{item['intraday_growth']:.2f}%</td><td>{item['r3']:.2f}%</td><td>{item['r5']:.2f}%</td>"
+        f"<td>{item['burst_score']:.2f}</td>"
         f"<td>{'上方' if item['above_ma20'] else '下方'} / {'上方' if item['above_ma60'] else '下方'}</td>"
         f"<td>{html.escape(item.get('manager_names', '待核验'))}<small>{html.escape(_manager_years_text(item))}</small></td>"
         f"<td>{html.escape(_backtest_text(item))}</td>"
@@ -1458,7 +1556,9 @@ def _dashboard_decision_card(item: dict[str, Any]) -> str:
         "<article class='decision-card'>"
         f"<div class='decision-top'><span>{html.escape(item['code'])}</span><b>{html.escape(item['action'])}</b></div>"
         f"<h3>{html.escape(item['name'])}</h3>"
-        f"<div class='decision-metrics'><span>建议金额<strong>{item.get('amount', 0):.0f} 元</strong></span>"
+        f"<div class='decision-metrics'><span>盘中估算<strong>{item['intraday_growth']:.2f}%</strong></span>"
+        f"<span>爆发得分<strong>{item['burst_score']:.2f}</strong></span>"
+        f"<span>建议金额<strong>{item.get('amount', 0):.0f} 元</strong></span>"
         f"<span>计划持有<strong>{html.escape(holding)}</strong></span>"
         f"<span>次日情景<strong>{item.get('next_day_low', 0):.2f}% ～ {item.get('next_day_high', 0):.2f}%</strong></span></div>"
         f"<p>{html.escape(action)}</p><small>{html.escape(manager)}；{html.escape(_backtest_text(item))}；情景估计为{item.get('forecast_confidence', '低')}置信度，不是收益保证。</small>"
@@ -1490,13 +1590,7 @@ def build_dashboard(context: dict[str, Any], title: str) -> str:
         reverse=True,
     )
     metals_rows = "".join(_dashboard_metals_row(item) for item in metals)
-    decision_items = [item for item in results if item["action"] == "买入观察"][:3]
-    if not decision_items:
-        decision_items = [
-            item
-            for item in results
-            if item["action"] in {"等待回踩", "回测不支持", "持有/观察"}
-        ][:3]
+    decision_items = results[:3]
     decision_cards = "".join(_dashboard_decision_card(item) for item in decision_items)
     failures = "".join(f"<li>{html.escape(failure)}</li>" for failure in context["failures"])
     intraday = context.get("intraday_t0", [])
@@ -1513,46 +1607,52 @@ def build_dashboard(context: dict[str, Any], title: str) -> str:
     return f'''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html.escape(title)} · ETF Workbench</title>
+<script src="https://cdn.tailwindcss.com"></script><script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
 <style>
-:root {{ color-scheme: light; --ink:#19212b; --muted:#66717f; --line:#dfe5eb; --panel:#fff; --bg:#f4f6f8; --green:#087f5b; --red:#c92a2a; --blue:#1769aa; }}
-* {{ box-sizing:border-box; }} body {{ margin:0; background:var(--bg); color:var(--ink); font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif; }}
-main {{ max-width:1240px; margin:0 auto; padding:32px 20px 56px; }} header {{ display:flex; justify-content:space-between; gap:24px; align-items:flex-end; margin-bottom:24px; }}
-.eyebrow {{ color:var(--blue); font-size:12px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }} h1 {{ margin:5px 0 4px; font-size:clamp(26px,4vw,42px); line-height:1.15; }} p {{ margin:0; color:var(--muted); }}
-.stamp {{ color:var(--muted); text-align:right; white-space:nowrap; }} .stats {{ display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:12px; margin-bottom:22px; }}
-.stat, .table-panel, .notes {{ background:var(--panel); border:1px solid var(--line); border-radius:8px; }} .stat {{ padding:16px; }} .stat b {{ display:block; font-size:25px; }} .stat span {{ color:var(--muted); font-size:13px; }}
-.metals-heading {{ border-left:4px solid #b7791f; background:#fffaf0; }} .metals-heading h2 {{ color:#8a5a00; }}
-.section-title {{ display:flex; align-items:flex-end; justify-content:space-between; gap:16px; margin:28px 0 10px; }} .section-title h2 {{ margin:0; font-size:20px; }}
-.decision-grid {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; }} .decision-card {{ background:#fff; border:1px solid var(--line); border-top:3px solid var(--blue); border-radius:8px; padding:16px; }}
+:root {{ color-scheme:dark; --ink:#f7fafc; --muted:#aeb8c5; --line:rgba(255,255,255,.13); --panel:rgba(20,27,36,.76); --bg:#090d12; --green:#5ee0a0; --red:#ff6b76; --blue:#67c5ff; --amber:#ffc857; }}
+* {{ box-sizing:border-box; letter-spacing:0; }} body {{ margin:0; background:var(--bg); color:var(--ink); font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif; }}
+body::before {{ content:""; position:fixed; inset:0; pointer-events:none; background:rgba(255,255,255,.015); }}
+main {{ position:relative; max-width:1320px; margin:0 auto; padding:28px 20px 56px; }} header {{ display:flex; justify-content:space-between; gap:24px; align-items:flex-end; padding:22px; margin-bottom:16px; border:1px solid var(--line); background:rgba(15,22,30,.82); backdrop-filter:blur(18px); border-radius:8px; }}
+.eyebrow {{ color:var(--blue); font-size:12px; font-weight:800; text-transform:uppercase; }} h1 {{ margin:5px 0 4px; font-size:clamp(26px,4vw,42px); line-height:1.15; }} h2,h3 {{ color:var(--ink); }} p {{ margin:0; color:var(--muted); }} a {{ color:var(--blue); }}
+.stamp {{ color:var(--muted); text-align:right; white-space:nowrap; }} .stats {{ display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:10px; margin-bottom:18px; }}
+.stat,.table-panel,.notes,.lookup,.calculator,.chart-panel {{ background:var(--panel); border:1px solid var(--line); backdrop-filter:blur(16px); border-radius:8px; }} .stat {{ padding:15px; }} .stat b {{ display:block; color:var(--ink); font-size:25px; }} .stat span {{ color:var(--muted); font-size:12px; }}
+.metals-heading {{ border-left:4px solid var(--amber); }} .metals-heading h2 {{ color:var(--amber); }}
+.section-title {{ display:flex; align-items:flex-end; justify-content:space-between; gap:16px; margin:26px 0 10px; }} .section-title h2 {{ margin:0; font-size:20px; }}
+.decision-grid {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; }} .decision-card {{ min-width:0; background:rgba(25,34,45,.84); border:1px solid var(--line); border-top:3px solid var(--blue); border-radius:8px; padding:16px; }}
 .decision-card h3 {{ font-size:17px; line-height:1.35; margin:10px 0 14px; }} .decision-top {{ display:flex; justify-content:space-between; gap:10px; color:var(--muted); font-size:12px; }} .decision-top b {{ color:var(--blue); }}
-.decision-metrics {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; margin-bottom:12px; }} .decision-metrics span {{ color:var(--muted); font-size:11px; }} .decision-metrics strong {{ display:block; color:var(--ink); font-size:13px; }} .decision-card small {{ color:var(--muted); }}
-.lookup {{ background:#fff; border:1px solid var(--line); border-radius:8px; padding:18px; margin:22px 0; }} .lookup h2 {{ margin:0 0 4px; font-size:20px; }} .lookup-bar,.toolbar {{ display:flex; gap:10px; margin:14px 0; }} input, select, button {{ border:1px solid var(--line); background:#fff; border-radius:6px; padding:10px 12px; color:var(--ink); }} input {{ flex:1; min-width:160px; }} button {{ background:var(--ink); color:#fff; cursor:pointer; }}
-.query-result {{ display:none; border-top:1px solid var(--line); padding-top:14px; }} .query-result.visible {{ display:block; }} .query-result h3 {{ margin:0 0 8px; }} .query-grid {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }} .query-grid span {{ background:#f8fafb; padding:10px; color:var(--muted); font-size:12px; }} .query-grid b {{ display:block; color:var(--ink); font-size:14px; }} .news-list {{ margin:10px 0 0; color:var(--muted); }}
-.table-panel {{ overflow:auto; }} table {{ width:100%; border-collapse:collapse; min-width:930px; }} th,td {{ padding:12px 13px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} th {{ background:#f8fafb; color:var(--muted); font-size:12px; white-space:nowrap; }} td small {{ display:block; color:var(--muted); }} tr:last-child td {{ border-bottom:0; }}
-.positive {{ color:var(--green); font-weight:700; }} .danger {{ color:var(--red); font-weight:700; }} .neutral {{ color:#8a5a00; }} .notes {{ padding:16px; margin-top:16px; }} .notes h2 {{ font-size:16px; margin:0 0 8px; }} .notes ul {{ margin:8px 0 0; padding-left:20px; color:var(--muted); }}
-@media (max-width:800px) {{ main {{ padding:22px 12px 40px; }} header {{ display:block; }} .stamp {{ text-align:left; margin-top:10px; }} .stats {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .decision-grid {{ grid-template-columns:1fr; }} .decision-metrics,.query-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .toolbar,.lookup-bar {{ flex-direction:column; }} }}
+.decision-metrics {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin-bottom:12px; }} .decision-metrics span,.query-grid span {{ min-width:0; padding:8px; background:rgba(255,255,255,.045); color:var(--muted); font-size:11px; border-radius:6px; }} .decision-metrics strong,.query-grid b {{ display:block; overflow-wrap:anywhere; color:var(--ink); font-size:13px; }} .decision-card small {{ color:var(--muted); }}
+.lookup,.calculator {{ padding:18px; margin:16px 0; }} .lookup h2,.calculator h2 {{ margin:0 0 4px; font-size:20px; }} .lookup-bar,.toolbar,.calculator-grid {{ display:flex; gap:10px; margin:14px 0; }} input,select,button {{ min-height:42px; border:1px solid var(--line); background:#111922; border-radius:6px; padding:9px 11px; color:var(--ink); }} input {{ flex:1; min-width:140px; }} button {{ background:#1e8ac4; border-color:#1e8ac4; color:#fff; cursor:pointer; font-weight:700; }}
+.query-result {{ display:none; border-top:1px solid var(--line); padding-top:14px; }} .query-result.visible {{ display:block; }} .query-result h3 {{ margin:0 0 8px; }} .query-grid {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; }} .news-list {{ margin:10px 0 0; color:var(--muted); }}
+.visual-grid {{ display:grid; grid-template-columns:minmax(0,1.2fr) minmax(280px,.8fr); gap:10px; margin:16px 0; }} .chart-panel {{ min-height:300px; padding:16px; }} .chart-panel h2 {{ margin:0 0 12px; font-size:18px; }} .chart-box {{ height:245px; position:relative; }} .calc-output {{ color:var(--green); font-size:18px; font-weight:800; }}
+.table-panel {{ overflow:auto; }} table {{ width:100%; border-collapse:collapse; min-width:1040px; }} th,td {{ padding:11px 12px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} th {{ position:sticky; top:0; z-index:1; background:#111820; color:var(--muted); font-size:12px; white-space:nowrap; }} td small {{ display:block; color:var(--muted); }} tr:hover td {{ background:rgba(255,255,255,.025); }} tr:last-child td {{ border-bottom:0; }}
+.positive {{ color:var(--green); font-weight:700; }} .danger {{ color:var(--red); font-weight:700; }} .neutral {{ color:var(--amber); }} .notes {{ padding:16px; margin-top:16px; }} .notes h2 {{ font-size:16px; margin:0 0 8px; }} .notes ul {{ margin:8px 0 0; padding-left:20px; color:var(--muted); }}
+@media (max-width:800px) {{ main {{ padding:12px 9px 36px; }} header {{ display:block; padding:16px; }} .stamp {{ text-align:left; margin-top:10px; }} .stats {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .decision-grid,.visual-grid {{ grid-template-columns:1fr; }} .query-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .toolbar,.lookup-bar,.calculator-grid {{ flex-direction:column; }} .chart-panel {{ min-height:270px; }} }}
 </style></head><body><main>
-<header><div><div class="eyebrow">ETF WORKBENCH · {TOTAL_CAPITAL} CNY MODE</div><h1>{html.escape(title)}</h1><p>全市场动量、相对沪深300强弱与风险回撤的可视化筛选。</p></div><div class="stamp">更新时间<br><strong>{now:%Y-%m-%d %H:%M} 北京时间</strong></div></header>
+<header><div><div class="eyebrow">HIGH BURST FUND WORKBENCH · {TOTAL_CAPITAL} CNY</div><h1>{html.escape(title)}</h1><p>盘中净值估算、3/5/20日爆发动量、历史回测与持仓风控。</p></div><div class="stamp">更新时间<br><strong>{now:%Y-%m-%d %H:%M} 北京时间</strong><br>估值覆盖 {context.get('intraday_estimation_count', 0)} 只</div></header>
 <section class="stats"><div class="stat"><span>当前持仓</span><b>{len(holdings)}</b></div><div class="stat"><span>已投入</span><b>{context.get('invested_amount', 0):.0f}</b></div><div class="stat"><span>剩余资金</span><b>{context.get('remaining_cash', TOTAL_CAPITAL):.0f}</b></div><div class="stat"><span>有色/稀土</span><b>{len(metals)}</b></div><div class="stat"><span>有效标的</span><b>{len(results)}</b></div></section>
-<div class="section-title"><div><h2>今天先看这里</h2><p>按操作优先级展示；没有通过全部门槛时只给观察项，不强行凑买入建议。</p></div></div>
+<div class="section-title"><div><h2>今日盘中动量冲刺 Top 3</h2><p>按 45% 盘中估算 + 30% 近3日 + 15% 近5日 + 10% 近20日排序；动作仍接受回测与防追高约束。</p></div></div>
 <section class="decision-grid">{decision_cards or '<article class="decision-card"><h3>今天没有通过全部门槛的候选</h3><p>保留现金，不为了目标涨幅强行交易。</p></article>'}</section>
 <section class="lookup"><h2>查一只基金</h2><p>输入本次已扫描的基金代码或名称，立即查看金额、计划持有期、经理经验、次日情景和风险依据。</p><div class="lookup-bar"><input id="fund-query" type="search" inputmode="search" placeholder="例如：004433 或 南方有色"><button id="query-button" type="button">查询</button></div><div id="query-result" class="query-result" aria-live="polite"></div></section>
+<section class="visual-grid"><div class="chart-panel"><h2>板块爆发热度</h2><div class="chart-box"><canvas id="sector-chart"></canvas></div></div><div class="calculator"><h2>2000 元分批加仓计算器</h2><p>按剩余资金和计划批次数计算，不自动执行交易。</p><div class="calculator-grid"><input id="capital-input" type="number" min="100" step="100" value="{max(0, context.get('remaining_cash', TOTAL_CAPITAL)):.0f}" aria-label="可用资金"><input id="batch-input" type="number" min="1" max="10" value="5" aria-label="计划批次数"><button id="calc-button" type="button">计算</button></div><div id="calc-output" class="calc-output"></div></div></section>
 <section class="notes"><h2>我的持仓与最新操作建议</h2><p>操作建议依据最新可用净值、均线、动量、回撤和赎回费期限生成；待确认订单不重复加仓。</p></section>
 <section class="table-panel"><table><thead><tr><th>持有基金</th><th>买入时间</th><th>金额</th><th>状态</th><th>最新净值</th><th>趋势</th><th>20日回撤</th><th>持仓收益</th><th>当前操作</th></tr></thead><tbody>{holding_rows or '<tr><td colspan="9">尚未录入持仓。</td></tr>'}</tbody></table></section>
 <section class="notes metals-heading" id="metals"><h2>有色金属与稀土专区</h2><p>已固定跟踪支付宝场外联接基金和场内 ETF。当前日涨幅超过 {ENTRY_MAX_DAILY_MOVE:.1f}% 会标记为“等待回踩”，避免把冲高后的价格当成买点。</p></section>
-<section class="table-panel"><table><thead><tr><th>有色/稀土标的</th><th>数据日期</th><th>1日</th><th>3日</th><th>5日</th><th>7日短动量</th><th>MA20 / MA60</th><th>基金经理</th><th>同规则回测</th><th>次日情景区间</th><th>当前动作</th></tr></thead><tbody>{metals_rows or '<tr><td colspan="11">本次有色金属数据获取失败，已保留标的并等待下次重试。</td></tr>'}</tbody></table></section>
+<section class="table-panel"><table><thead><tr><th>有色/稀土标的</th><th>数据日期</th><th>盘中估算</th><th>3日</th><th>5日</th><th>爆发得分</th><th>MA20 / MA60</th><th>基金经理</th><th>同规则回测</th><th>次日情景区间</th><th>当前动作</th></tr></thead><tbody>{metals_rows or '<tr><td colspan="11">本次有色金属数据获取失败，已保留标的并等待下次重试。</td></tr>'}</tbody></table></section>
 <section class="notes"><h2>入场分层候选</h2><p>首选试仓只在趋势、相对强度和历史滚动回测同时支持时出现；单日冲高标记“等待回踩”，历史样本不支持则不买入。</p></section>
-<div class="toolbar"><input id="search" type="search" placeholder="搜索名称或代码"><select id="kind"><option value="all">全部标的</option><option value="alipay_a">支付宝 A 类</option><option value="alipay_c">支付宝 C 类</option><option value="linked_c">自动匹配 C 类</option><option value="etf">场内 ETF</option></select></div>
-<section class="table-panel"><table><thead><tr><th>排名</th><th>标的</th><th>数据日期</th><th>最新1日</th><th>20日最大单日涨幅</th><th>7日短动量</th><th>池内分位</th><th>20日收益 / RS</th><th>MA20 / MA60</th><th>基金经理</th><th>同规则回测</th><th>次日情景区间</th><th>20日回撤</th><th>动作与依据</th></tr></thead><tbody id="rows">{rows}</tbody></table></section>
+<div class="toolbar"><input id="search" type="search" placeholder="搜索名称或代码"><select id="kind"><option value="all">全部标的</option><option value="alipay_a">支付宝 A 类</option><option value="alipay_c">支付宝 C 类</option><option value="linked_c">自动匹配 C 类</option><option value="etf">场内 ETF</option></select><select id="sector"><option value="all">全部板块</option><option>半导体</option><option>AI / 科技</option><option>游戏传媒</option><option>小微盘</option><option>港股 / QDII</option><option>有色金属</option><option>科创50</option><option>医疗</option><option>消费电子</option><option>证券</option><option>黄金</option><option>其他</option></select></div>
+<section class="table-panel"><table><thead><tr><th>排名</th><th>标的</th><th>数据日期</th><th>盘中估算</th><th>最新1日</th><th>20日最大单日涨幅</th><th>爆发得分</th><th>池内分位</th><th>20日收益 / RS</th><th>MA20 / MA60</th><th>基金经理</th><th>同规则回测</th><th>次日情景区间</th><th>20日回撤</th><th>动作与依据</th></tr></thead><tbody id="rows">{rows}</tbody></table></section>
 <section class="notes"><h2>T+0 日内盈利可执行性</h2><p>仅列出规则允许当日回转的代表性债券、黄金和跨境 ETF。成本门槛通过不等于盈利预测；回本涨幅还未计买卖价差、滑点和溢价风险。</p></section>
 <section class="table-panel"><table><thead><tr><th>T+0 标的</th><th>现价</th><th>当日涨跌</th><th>1 手金额</th><th>最多成交</th><th>佣金回本涨幅</th><th>结论</th></tr></thead><tbody>{intraday_rows or '<tr><td colspan="7">本次未获取到可核验的 T+0 行情。</td></tr>'}</tbody></table></section>
 <section class="notes"><h2>风控与数据状态</h2><p>总资金 {TOTAL_CAPITAL} 元，单笔加仓控制在 {BUY_MIN}～{BUY_MAX} 元。场内 ETF 按买卖各最低 {BROKER_MIN_COMMISSION:.0f} 元佣金过滤，往返成本超过 {MAX_EXCHANGE_ROUND_TRIP_COST_PCT:.1f}% 时只观察；支付宝 C 类按实时赎回费率给出最低计划持有天数，最终以购买页为准。</p><p>注意：AKShare 是公开数据接口聚合层，场外/ QDII 净值不是盘中实时成交价；开放式基金日净值通常在交易日 16:00～23:00 更新。早盘看到的“关联板块”只能作为方向参考，不能当作你的实际当日收益。</p>{f'<ul>{failures}</ul>' if failures else '<p>本次扫描未记录接口失败。</p>'}</section>
 <script type="application/json" id="dashboard-data">{data_json}</script><script>
-const data=JSON.parse(document.getElementById('dashboard-data').textContent); const search=document.getElementById('search'); const kind=document.getElementById('kind'); const fundQuery=document.getElementById('fund-query'); const queryButton=document.getElementById('query-button'); const queryResult=document.getElementById('query-result');
-function filterRows(){{const q=search.value.trim().toLowerCase(), k=kind.value; document.querySelectorAll('#rows tr').forEach(row=>{{const text=row.textContent.toLowerCase(); row.hidden=(q&&!text.includes(q))||(k!=='all'&&row.dataset.kind!==k);}});}}
-search.addEventListener('input',filterRows); kind.addEventListener('change',filterRows);
+const data=JSON.parse(document.getElementById('dashboard-data').textContent); const search=document.getElementById('search'); const kind=document.getElementById('kind'); const sector=document.getElementById('sector'); const fundQuery=document.getElementById('fund-query'); const queryButton=document.getElementById('query-button'); const queryResult=document.getElementById('query-result');
+function filterRows(){{const q=search.value.trim().toLowerCase(), k=kind.value, s=sector.value; document.querySelectorAll('#rows tr').forEach(row=>{{const text=row.textContent.toLowerCase(); row.hidden=(q&&!text.includes(q))||(k!=='all'&&row.dataset.kind!==k)||(s!=='all'&&row.dataset.sector!==s);}});}}
+search.addEventListener('input',filterRows); kind.addEventListener('change',filterRows); sector.addEventListener('change',filterRows);
 function addText(parent,tag,text,className){{const node=document.createElement(tag); node.textContent=text; if(className)node.className=className; parent.appendChild(node); return node;}}
-function runQuery(){{const q=fundQuery.value.trim().toLowerCase(); queryResult.replaceChildren(); queryResult.classList.add('visible'); if(!q){{addText(queryResult,'p','请输入基金代码或名称。'); return;}} const matches=data.results.filter(item=>item.code.toLowerCase()===q||item.name.toLowerCase().includes(q)); if(!matches.length){{addText(queryResult,'h3','本次扫描池中没有找到'); addText(queryResult,'p','请把基金代码发给我，我可以先核验代码、费率和数据，再决定是否加入固定扫描池。'); return;}} const item=matches[0]; addText(queryResult,'h3',item.code+' · '+item.name); const grid=addText(queryResult,'div','', 'query-grid'); const holding=item.fee_free_days?('至少 '+item.fee_free_days+' 天'):(item.kind==='etf'?'1～7 天复核':'赎回前核对费率'); const manager=item.manager_years!=null?(item.manager_names+' · '+item.manager_years.toFixed(1)+' 年'):'待核验'; const backtest=item.backtest_signals?('样本 '+item.backtest_signals+' 次；3/5日胜率 '+item.backtest_win3.toFixed(1)+'% / '+item.backtest_win5.toFixed(1)+'%'):'样本不足'; [['当前结论',item.action],['建议金额',(item.amount||0)+' 元'],['计划持有',holding],['基金经理',manager],['1/3/5日',item.r1.toFixed(2)+'% / '+item.r3.toFixed(2)+'% / '+item.r5.toFixed(2)+'%'],['同规则回测',backtest],['次日情景',item.next_day_low.toFixed(2)+'% ～ '+item.next_day_high.toFixed(2)+'%'],['置信度',item.forecast_confidence],['数据日期',item.data_date]].forEach(pair=>{{const box=addText(grid,'span',pair[0]); addText(box,'b',pair[1]);}}); addText(queryResult,'p','提示：情景区间由近期波动、趋势和有限新闻标题估算，不是收益承诺。'); const newsItems=item.news_items||[]; if(newsItems.length){{const list=addText(queryResult,'ul','', 'news-list'); newsItems.forEach(news=>{{const li=document.createElement('li'); const link=document.createElement('a'); link.textContent=news.title; if(/^https?:\/\//.test(news.url)){{link.href=news.url; link.target='_blank'; link.rel='noopener noreferrer';}} li.appendChild(link); addText(li,'small',(news.source||'来源待核验')+(news.published?' · '+news.published:'')); list.appendChild(li);}});}}}}
+function runQuery(){{const q=fundQuery.value.trim().toLowerCase(); queryResult.replaceChildren(); queryResult.classList.add('visible'); if(!q){{addText(queryResult,'p','请输入基金代码或名称。'); return;}} const matches=data.results.filter(item=>item.code.toLowerCase()===q||item.name.toLowerCase().includes(q)); if(!matches.length){{addText(queryResult,'h3','本次扫描池中没有找到'); addText(queryResult,'p','请把基金代码发给我，我可以先核验代码、费率和数据，再决定是否加入固定扫描池。'); return;}} const item=matches[0]; addText(queryResult,'h3',item.code+' · '+item.name); const grid=addText(queryResult,'div','', 'query-grid'); const holding=item.fee_free_days?('至少 '+item.fee_free_days+' 天'):(item.kind==='etf'?'1～7 天复核':'赎回前核对费率'); const manager=item.manager_years!=null?(item.manager_names+' · '+item.manager_years.toFixed(1)+' 年'):'待核验'; const backtest=item.backtest_signals?('样本 '+item.backtest_signals+' 次；3/5日胜率 '+item.backtest_win3.toFixed(1)+'% / '+item.backtest_win5.toFixed(1)+'%'):'样本不足'; [['当前结论',item.action],['建议金额',(item.amount||0)+' 元'],['计划持有',holding],['板块',item.sector],['盘中估算',item.intraday_growth.toFixed(2)+'% · '+item.est_source],['爆发得分',item.burst_score.toFixed(2)],['1/3/5日',item.r1.toFixed(2)+'% / '+item.r3.toFixed(2)+'% / '+item.r5.toFixed(2)+'%'],['基金经理',manager],['同规则回测',backtest],['次日情景',item.next_day_low.toFixed(2)+'% ～ '+item.next_day_high.toFixed(2)+'%'],['置信度',item.forecast_confidence],['数据日期',item.data_date]].forEach(pair=>{{const box=addText(grid,'span',pair[0]); addText(box,'b',pair[1]);}}); addText(queryResult,'p','提示：盘中净值估算不是正式净值，情景区间也不是收益承诺。'); const newsItems=item.news_items||[]; if(newsItems.length){{const list=addText(queryResult,'ul','', 'news-list'); newsItems.forEach(news=>{{const li=document.createElement('li'); const link=document.createElement('a'); link.textContent=news.title; if(/^https?:\/\//.test(news.url)){{link.href=news.url; link.target='_blank'; link.rel='noopener noreferrer';}} li.appendChild(link); addText(li,'small',(news.source||'来源待核验')+(news.published?' · '+news.published:'')); list.appendChild(li);}});}}}}
 queryButton.addEventListener('click',runQuery); fundQuery.addEventListener('keydown',event=>{{if(event.key==='Enter')runQuery();}});
+const capitalInput=document.getElementById('capital-input'), batchInput=document.getElementById('batch-input'), calcOutput=document.getElementById('calc-output'); function calculateBatches(){{const capital=Math.max(0,Number(capitalInput.value)||0), batches=Math.max(1,Number(batchInput.value)||1); const raw=capital/batches; const each=Math.max({BUY_MIN},Math.min({BUY_MAX},Math.round(raw/50)*50)); const possible=Math.floor(capital/each); calcOutput.textContent=capital<{BUY_MIN}?'可用资金低于单笔下限。':'建议每笔 '+each+' 元，最多 '+possible+' 笔；每次只执行通过风控的信号。';}} document.getElementById('calc-button').addEventListener('click',calculateBatches); calculateBatches();
+const sectorMap=new Map(); data.results.forEach(item=>{{const bucket=sectorMap.get(item.sector)||[]; bucket.push(item.burst_score); sectorMap.set(item.sector,bucket);}}); const sectorRows=[...sectorMap.entries()].map(([label,values])=>({{label,value:values.reduce((a,b)=>a+b,0)/values.length}})).sort((a,b)=>b.value-a.value).slice(0,8); const chartCanvas=document.getElementById('sector-chart'); if(window.Chart&&chartCanvas){{new Chart(chartCanvas,{{type:'bar',data:{{labels:sectorRows.map(x=>x.label),datasets:[{{label:'平均爆发得分',data:sectorRows.map(x=>x.value),backgroundColor:sectorRows.map(x=>x.value>=0?'rgba(94,224,160,.72)':'rgba(255,107,118,.72)'),borderWidth:0}}]}},options:{{responsive:true,maintainAspectRatio:false,indexAxis:'y',plugins:{{legend:{{display:false}}}},scales:{{x:{{grid:{{color:'rgba(255,255,255,.08)'}},ticks:{{color:'#aeb8c5'}}}},y:{{grid:{{display:false}},ticks:{{color:'#f7fafc'}}}}}}}}}});}}
 </script></main></body></html>'''
 
 
