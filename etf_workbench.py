@@ -63,14 +63,17 @@ INTRADAY_MAX_ROUND_TRIP_COST_PCT = _non_negative_float_env(
     "INTRADAY_MAX_ROUND_TRIP_COST_PCT", 1.0
 )
 TARGET_DAILY_MOVE = _non_negative_float_env("TARGET_DAILY_MOVE", 3.0)
+ENTRY_MAX_DAILY_MOVE = _non_negative_float_env("ENTRY_MAX_DAILY_MOVE", 2.5)
+ENTRY_MIN_DAILY_MOVE = -_non_negative_float_env("ENTRY_PULLBACK_LIMIT", 2.5)
+MIN_BACKTEST_SIGNALS = _positive_int_env("MIN_BACKTEST_SIGNALS", 8)
 MOMENTUM_WEIGHTS = (0.65, 0.25, 0.10) if RISK_PROFILE == "aggressive" else (0.50, 0.30, 0.20)
 SHORT_MOMENTUM_WEIGHTS = (0.45, 0.30, 0.25)
 MAX_PLANNED_HOLD_DAYS = _positive_int_env("MAX_PLANNED_HOLD_DAYS", 7)
 MANAGER_MIN_YEARS = _non_negative_float_env("MANAGER_MIN_YEARS", 10.0)
 NEWS_LOOKBACK_DAYS = 3
 NEWS_MAX_THEMES = 6
-SIGNAL_PERCENTILE = 80 if RISK_PROFILE == "aggressive" else 70
-SIGNAL_MIN_SCORE = 1.5 if RISK_PROFILE == "aggressive" else 0.0
+SIGNAL_PERCENTILE = 65 if RISK_PROFILE == "aggressive" else 70
+SIGNAL_MIN_SCORE = 0.0 if RISK_PROFILE == "aggressive" else 0.0
 REQUIRE_MA60 = RISK_PROFILE != "aggressive"
 BENCHMARK = {"code": "510300", "name": "沪深300ETF", "kind": "benchmark", "data_codes": ("510300",)}
 
@@ -343,7 +346,17 @@ def scan_market_etfs() -> list[dict[str, Any]]:
             liquid = work
     else:
         liquid = work
-    liquid = liquid.sort_values(["_change", "_amount"], ascending=False).head(MAX_DYNAMIC_CANDIDATES)
+    # 保留高流动性、温和上涨和强势异动三组，避免动态池完全被当日涨停附近的品种占满。
+    liquid_by_turnover = liquid.sort_values("_amount", ascending=False).head(8)
+    moderate = liquid[
+        liquid["_change"].between(ENTRY_MIN_DAILY_MOVE, ENTRY_MAX_DAILY_MOVE, inclusive="both")
+    ].sort_values(["_change", "_amount"], ascending=False).head(6)
+    movers = liquid.sort_values(["_change", "_amount"], ascending=False).head(4)
+    liquid = (
+        pd.concat([liquid_by_turnover, moderate, movers], ignore_index=True)
+        .drop_duplicates("_code")
+        .head(MAX_DYNAMIC_CANDIDATES)
+    )
     return [
         {"code": row["_code"], "name": row["_name"], "kind": "etf", "data_codes": (row["_code"],), "dynamic": True}
         for _, row in liquid.iterrows()
@@ -561,6 +574,55 @@ def _return(close: pd.Series, days: int) -> float:
     return (float(close.iloc[-1]) / float(close.iloc[-1 - days]) - 1) * 100
 
 
+def _rolling_entry_backtest(close: pd.Series) -> dict[str, Any]:
+    """Walk forward through history and score the same non-chasing entry rule."""
+    outcomes: list[tuple[float, float]] = []
+    for index in range(60, len(close) - 5):
+        window = close.iloc[: index + 1]
+        latest = float(window.iloc[-1])
+        r1 = _return(window, 1)
+        r3 = _return(window, 3)
+        r5 = _return(window, 5)
+        r20 = _return(window, 20)
+        ma20 = float(window.tail(20).mean())
+        high20 = float(window.tail(20).max())
+        drawdown = (latest / high20 - 1) * 100
+        entry = (
+            r3 > 0
+            and r5 > 0
+            and r20 > 0
+            and latest >= ma20
+            and ENTRY_MIN_DAILY_MOVE <= r1 <= ENTRY_MAX_DAILY_MOVE
+            and drawdown > MAX_DRAWDOWN_LIMIT
+        )
+        if entry:
+            outcomes.append(
+                (
+                    (float(close.iloc[index + 3]) / latest - 1) * 100,
+                    (float(close.iloc[index + 5]) / latest - 1) * 100,
+                )
+            )
+    if not outcomes:
+        return {
+            "backtest_signals": 0,
+            "backtest_win3": None,
+            "backtest_win5": None,
+            "backtest_avg3": None,
+            "backtest_avg5": None,
+            "backtest_worst5": None,
+        }
+    three_day = [item[0] for item in outcomes]
+    five_day = [item[1] for item in outcomes]
+    return {
+        "backtest_signals": len(outcomes),
+        "backtest_win3": sum(value > 0 for value in three_day) / len(three_day) * 100,
+        "backtest_win5": sum(value > 0 for value in five_day) / len(five_day) * 100,
+        "backtest_avg3": sum(three_day) / len(three_day),
+        "backtest_avg5": sum(five_day) / len(five_day),
+        "backtest_worst5": min(five_day),
+    }
+
+
 def analyse_item(
     item: dict[str, Any], benchmark_returns: dict[int, float], as_of: datetime
 ) -> dict[str, Any]:
@@ -622,6 +684,7 @@ def analyse_item(
         "target_move_days20": target_move_days20,
         "high_move_capable": max_daily_gain20 >= TARGET_DAILY_MOVE,
         "benchmark_verified": bool(benchmark_returns),
+        **_rolling_entry_backtest(close),
     }
 
 
@@ -643,21 +706,57 @@ def _rank_results(results: list[dict[str, Any]]) -> None:
         elif item["stop"]:
             item["action"] = "风控止损"
             item["amount"] = 0
-        elif (
-            item["selection_score"] >= SIGNAL_MIN_SCORE
-            and item["r3"] > 0
-            and item["r5"] > 0
-            and item["above_ma20"]
-            and (item["above_ma60"] or not REQUIRE_MA60)
-            and item["pool_percentile"] >= SIGNAL_PERCENTILE
-            and item["rs20"] > 0
-            and item["rs_score"] > 0
-            and (RISK_PROFILE != "aggressive" or item["high_move_capable"])
-            and (RISK_PROFILE != "aggressive" or item["r1"] >= TARGET_DAILY_MOVE)
-        ):
+        else:
+            trend_entry = (
+                item["selection_score"] >= SIGNAL_MIN_SCORE
+                and item["r3"] > 0
+                and item["r5"] > 0
+                and item["r20"] > 0
+                and item["above_ma20"]
+                and (item["above_ma60"] or not REQUIRE_MA60)
+                and item["pool_percentile"] >= SIGNAL_PERCENTILE
+                and item["rs20"] > 0
+                and item["rs_score"] > 0
+            )
+            backtest_supported = (
+                item["backtest_signals"] >= MIN_BACKTEST_SIGNALS
+                and (
+                    (
+                        item["backtest_win3"] is not None
+                        and item["backtest_win3"] >= 52
+                        and item["backtest_avg3"] > 0
+                    )
+                    or (
+                        item["backtest_win5"] is not None
+                        and item["backtest_win5"] >= 52
+                        and item["backtest_avg5"] > 0
+                    )
+                )
+            )
+            if not trend_entry:
+                item["action"] = "持有/观察" if item["above_ma20"] else "暂缓/观望"
+                item["amount"] = 0
+                continue
+            if item["r1"] > ENTRY_MAX_DAILY_MOVE:
+                item["action"] = "等待回踩"
+                item["amount"] = 0
+                continue
+            if item["r1"] < ENTRY_MIN_DAILY_MOVE:
+                item["action"] = "下跌未止"
+                item["amount"] = 0
+                continue
+            if not backtest_supported:
+                item["action"] = "回测不支持"
+                item["amount"] = 0
+                continue
             proposed_amount = (
                 HIGH_CONVICTION_BUY
-                if item["pool_percentile"] >= 90 and item["selection_score"] >= 4
+                if (
+                    item["pool_percentile"] >= 80
+                    and item["backtest_win3"] is not None
+                    and item["backtest_win3"] >= 60
+                    and item["backtest_avg3"] >= 0.5
+                )
                 else STANDARD_BUY
             )
             item["suggested_amount"] = proposed_amount
@@ -672,12 +771,6 @@ def _rank_results(results: list[dict[str, Any]]) -> None:
                     continue
             item["action"] = "买入观察"
             item["amount"] = proposed_amount
-        elif item["above_ma20"]:
-            item["action"] = "持有/观察"
-            item["amount"] = 0
-        else:
-            item["action"] = "暂缓/观望"
-            item["amount"] = 0
 
 
 def _fetch_manager_frame() -> tuple[pd.DataFrame, list[int]]:
@@ -780,15 +873,8 @@ def enrich_manager_experience(results: list[dict[str, Any]], failures: list[str]
     except Exception as exc:
         failures.append(f"基金经理从业数据：{_short_error(exc)}")
 
-    for item in results:
-        if item.get("action") != "买入观察":
-            continue
-        if not item["manager_verified"]:
-            item["action"] = "经理待核验"
-            item["amount"] = 0
-        elif not item["manager_preference_met"]:
-            item["action"] = "经理年限未达偏好"
-            item["amount"] = 0
+    # 经理经验是质量提示，不是指数联接基金的硬性买入门槛；被动基金的核心风险
+    # 还包括跟踪误差、费用、溢价和标的指数走势。未知数据只降低置信度，不篡改行情信号。
 
 
 def _news_keyword(item: dict[str, Any]) -> str:
@@ -1100,6 +1186,18 @@ def _action_text(item: dict[str, Any]) -> str:
             f"基金经理累计从业约 {item.get('manager_years', 0):.1f} 年，未达到偏好值 "
             f"{MANAGER_MIN_YEARS:.0f} 年，暂不新增资金"
         )
+    if item["action"] == "等待回踩":
+        return (
+            f"短线已上涨 {item['r1']:.2f}%，避免追涨；回落至 MA20 附近且趋势未破坏时，"
+            f"再考虑 {STANDARD_BUY} 元试仓"
+        )
+    if item["action"] == "下跌未止":
+        return f"最新1日 {item['r1']:.2f}% 且仍弱于入场区间，先等止跌，不接 falling knife"
+    if item["action"] == "回测不支持":
+        return (
+            f"历史同规则样本 {item['backtest_signals']} 次，3/5日胜率或平均收益未达门槛，"
+            "不把短期强势误当成买点"
+        )
     if item["action"] == "现金不足":
         return "当前持仓已占用绝大部分资金，剩余现金低于单笔下限，不再新增买入"
     if item["action"] == "买入观察":
@@ -1107,13 +1205,24 @@ def _action_text(item: dict[str, Any]) -> str:
             holding = item.get("fee_free_days")
             holding_text = f"计划至少持有 {holding} 天" if holding else "赎回前再次核对费率"
             return (
-                f"动量与趋势共振，建议在支付宝分批买入 {item['amount']} 元；{holding_text}；"
+                f"趋势与历史回测支持，建议在支付宝先试仓 {item['amount']} 元；{holding_text}；"
                 f"当前费率规则：{item.get('redemption_fee_summary', '未获取')}"
             )
-        return f"动量与趋势共振，建议分批买入 {item['amount']} 元"
+        return f"趋势与历史回测支持，建议分批试仓 {item['amount']} 元"
     if item["action"] == "持有/观察":
         return "站上 MA20，继续观察，不新增资金"
     return "低于 MA20 或相对强度不足，暂缓新增资金"
+
+
+def _backtest_text(item: dict[str, Any]) -> str:
+    if not item.get("backtest_signals") or item.get("backtest_win3") is None:
+        return "同规则历史样本不足"
+    return (
+        f"同规则回测 {item['backtest_signals']} 次，3/5日胜率 "
+        f"{item['backtest_win3']:.1f}% / {item['backtest_win5']:.1f}%（平均 "
+        f"{item['backtest_avg3']:.2f}% / {item['backtest_avg5']:.2f}%，"
+        f"最差5日 {item['backtest_worst5']:.2f}%）"
+    )
 
 
 def _line(item: dict[str, Any]) -> str:
@@ -1132,7 +1241,7 @@ def _line(item: dict[str, Any]) -> str:
         f"数据日期 {item['data_date']}，{trend}，相对沪深300超额20/60日 {item['rs20']:.2f}% / {item['rs60']:.2f}%，"
         f"回撤 {item['drawdown']:.2f}%；{manager}；次日情景区间 "
         f"{item.get('next_day_low', 0):.2f}%～{item.get('next_day_high', 0):.2f}%（{item.get('forecast_confidence', '低')}置信度），"
-        f"**{_action_text(item)}**。"
+        f"{_backtest_text(item)}，**{_action_text(item)}**。"
     )
 
 
@@ -1183,13 +1292,14 @@ def build_report(context: dict[str, Any]) -> tuple[str, str]:
     results = context["results"]
     alipay_results = [item for item in results if _is_alipay_fund(item["kind"])]
     exchange_results = [item for item in results if item["kind"] == "etf"]
-    high_move_results = sorted(
+    layered_candidates = sorted(
         (
             item
             for item in results
-            if item["r1"] >= TARGET_DAILY_MOVE and item["high_move_capable"] and not item["stale"]
+            if item["action"] in {"买入观察", "等待回踩", "回测不支持"}
+            and not item["stale"]
         ),
-        key=lambda item: (item["r1"], item["max_daily_gain20"], item["selection_score"]),
+        key=lambda item: (item["action"] == "买入观察", item["selection_score"]),
         reverse=True,
     )
     title = "早盘 7 日高弹性动量预选" if mode == "morning" else "支付宝 14:30 七日波段实操指南"
@@ -1211,12 +1321,12 @@ def build_report(context: dict[str, Any]) -> tuple[str, str]:
         "## 沪深300基准",
         f"数据日期：{context['benchmark_date'] or '未获取'}；5/20/60日：{benchmark.get(5, 0):.2f}% / {benchmark.get(20, 0):.2f}% / {benchmark.get(60, 0):.2f}%",
         "",
-        f"## {TARGET_DAILY_MOVE:.1f}%+ 高波动进攻候选",
+        "## 今日分层操作候选",
     ]
-    if high_move_results:
-        lines.extend(_line(item) for item in high_move_results[:6])
+    if layered_candidates:
+        lines.extend(_line(item) for item in layered_candidates[:6])
     else:
-        lines.append(f"- 今日无最新1日涨幅达到 {TARGET_DAILY_MOVE:.1f}% 且通过趋势检查的候选，不强行交易。")
+        lines.append("- 今日没有通过趋势、相对强度和滚动回测的试仓候选；报告仍列出持仓动作与等待条件。")
     lines += [
         "",
         "## 支付宝场外基金优先榜",
@@ -1252,7 +1362,8 @@ def build_report(context: dict[str, Any]) -> tuple[str, str]:
         "",
         f"**7日纪律：** 计划最长持有 {MAX_PLANNED_HOLD_DAYS} 天；场外基金只有免赎回费期限不超过该计划时才允许出现买入信号，到期必须复核。",
         f"**风险提示：** 当前为{'进攻' if RISK_PROFILE == 'aggressive' else '均衡'}档，1/3/5日短动量权重为 45%/30%/25%，可能带来更大回撤；不代表收益预测。",
-        f"**3%目标说明：** 仅表示近20个交易日曾出现单日上涨 ≥{TARGET_DAILY_MOVE:.1f}%，不代表下一交易日或每天都能上涨 {TARGET_DAILY_MOVE:.1f}%。",
+        f"**入场规则：** 最新1日涨幅高于 {ENTRY_MAX_DAILY_MOVE:.1f}% 视为过热并等待回踩，不再把单日大涨当作买点。",
+        "**回测说明：** 胜率和平均收益来自近150条净值/行情的滚动历史样本，不含未来数据，但仍可能过拟合且不代表未来。",
         "**免责声明：** 本报告由量化脚本自动生成，仅供研究参考，不构成投资建议。",
     ]
     if context["failures"]:
@@ -1277,6 +1388,7 @@ def _dashboard_row(item: dict[str, Any]) -> str:
         f"<td>{item['r20']:.2f}%<br><small>RS {item['rs20']:.2f}%</small></td>"
         f"<td>{'是' if item['above_ma20'] else '否'} / {'是' if item['above_ma60'] else '否'}</td>"
         f"<td>{html.escape(item.get('manager_names', '待核验'))}<small>{html.escape(_manager_years_text(item))}</small></td>"
+        f"<td>{html.escape(_backtest_text(item))}</td>"
         f"<td>{item.get('next_day_low', 0):.2f}% ～ {item.get('next_day_high', 0):.2f}%<small>{item.get('forecast_confidence', '低')}置信度</small></td>"
         f"<td class='{'danger' if item['stop'] else ''}'>{item['drawdown']:.2f}%</td>"
         f"<td class='{action_class}'>{html.escape(_action_text(item))}</td></tr>"
@@ -1324,6 +1436,7 @@ def _dashboard_metals_row(item: dict[str, Any]) -> str:
         f"<td>{item['short_score']:.2f}</td>"
         f"<td>{'上方' if item['above_ma20'] else '下方'} / {'上方' if item['above_ma60'] else '下方'}</td>"
         f"<td>{html.escape(item.get('manager_names', '待核验'))}<small>{html.escape(_manager_years_text(item))}</small></td>"
+        f"<td>{html.escape(_backtest_text(item))}</td>"
         f"<td>{item.get('next_day_low', 0):.2f}% ～ {item.get('next_day_high', 0):.2f}%<small>{item.get('forecast_confidence', '低')}置信度</small></td>"
         f"<td class='{action_class}'>{html.escape(_action_text(item))}</td></tr>"
     )
@@ -1348,7 +1461,7 @@ def _dashboard_decision_card(item: dict[str, Any]) -> str:
         f"<div class='decision-metrics'><span>建议金额<strong>{item.get('amount', 0):.0f} 元</strong></span>"
         f"<span>计划持有<strong>{html.escape(holding)}</strong></span>"
         f"<span>次日情景<strong>{item.get('next_day_low', 0):.2f}% ～ {item.get('next_day_high', 0):.2f}%</strong></span></div>"
-        f"<p>{html.escape(action)}</p><small>{html.escape(manager)}；情景估计为{item.get('forecast_confidence', '低')}置信度，不是收益保证。</small>"
+        f"<p>{html.escape(action)}</p><small>{html.escape(manager)}；{html.escape(_backtest_text(item))}；情景估计为{item.get('forecast_confidence', '低')}置信度，不是收益保证。</small>"
         "</article>"
     )
 
@@ -1379,7 +1492,11 @@ def build_dashboard(context: dict[str, Any], title: str) -> str:
     metals_rows = "".join(_dashboard_metals_row(item) for item in metals)
     decision_items = [item for item in results if item["action"] == "买入观察"][:3]
     if not decision_items:
-        decision_items = [item for item in results if item["action"] == "持有/观察"][:3]
+        decision_items = [
+            item
+            for item in results
+            if item["action"] in {"等待回踩", "回测不支持", "持有/观察"}
+        ][:3]
     decision_cards = "".join(_dashboard_decision_card(item) for item in decision_items)
     failures = "".join(f"<li>{html.escape(failure)}</li>" for failure in context["failures"])
     intraday = context.get("intraday_t0", [])
@@ -1421,11 +1538,11 @@ main {{ max-width:1240px; margin:0 auto; padding:32px 20px 56px; }} header {{ di
 <section class="lookup"><h2>查一只基金</h2><p>输入本次已扫描的基金代码或名称，立即查看金额、计划持有期、经理经验、次日情景和风险依据。</p><div class="lookup-bar"><input id="fund-query" type="search" inputmode="search" placeholder="例如：004433 或 南方有色"><button id="query-button" type="button">查询</button></div><div id="query-result" class="query-result" aria-live="polite"></div></section>
 <section class="notes"><h2>我的持仓与最新操作建议</h2><p>操作建议依据最新可用净值、均线、动量、回撤和赎回费期限生成；待确认订单不重复加仓。</p></section>
 <section class="table-panel"><table><thead><tr><th>持有基金</th><th>买入时间</th><th>金额</th><th>状态</th><th>最新净值</th><th>趋势</th><th>20日回撤</th><th>持仓收益</th><th>当前操作</th></tr></thead><tbody>{holding_rows or '<tr><td colspan="9">尚未录入持仓。</td></tr>'}</tbody></table></section>
-<section class="notes metals-heading" id="metals"><h2>有色金属与稀土专区</h2><p>已固定跟踪支付宝场外联接基金和场内 ETF。按 1/3/5 日短动量排序，动作仍受均线、回撤、赎回费和场内佣金约束。</p></section>
-<section class="table-panel"><table><thead><tr><th>有色/稀土标的</th><th>数据日期</th><th>1日</th><th>3日</th><th>5日</th><th>7日短动量</th><th>MA20 / MA60</th><th>基金经理</th><th>次日情景区间</th><th>当前动作</th></tr></thead><tbody>{metals_rows or '<tr><td colspan="10">本次有色金属数据获取失败，已保留标的并等待下次重试。</td></tr>'}</tbody></table></section>
-<section class="notes"><h2>{TARGET_DAILY_MOVE:.1f}%+ 七日高弹性候选</h2><p>按 1/3/5 日短动量筛选，计划最长持有 {MAX_PLANNED_HOLD_DAYS} 天；只有最新 1 日涨幅 ≥{TARGET_DAILY_MOVE:.1f}% 且趋势通过的标的才可能进入买入观察。</p></section>
+<section class="notes metals-heading" id="metals"><h2>有色金属与稀土专区</h2><p>已固定跟踪支付宝场外联接基金和场内 ETF。当前日涨幅超过 {ENTRY_MAX_DAILY_MOVE:.1f}% 会标记为“等待回踩”，避免把冲高后的价格当成买点。</p></section>
+<section class="table-panel"><table><thead><tr><th>有色/稀土标的</th><th>数据日期</th><th>1日</th><th>3日</th><th>5日</th><th>7日短动量</th><th>MA20 / MA60</th><th>基金经理</th><th>同规则回测</th><th>次日情景区间</th><th>当前动作</th></tr></thead><tbody>{metals_rows or '<tr><td colspan="11">本次有色金属数据获取失败，已保留标的并等待下次重试。</td></tr>'}</tbody></table></section>
+<section class="notes"><h2>入场分层候选</h2><p>首选试仓只在趋势、相对强度和历史滚动回测同时支持时出现；单日冲高标记“等待回踩”，历史样本不支持则不买入。</p></section>
 <div class="toolbar"><input id="search" type="search" placeholder="搜索名称或代码"><select id="kind"><option value="all">全部标的</option><option value="alipay_a">支付宝 A 类</option><option value="alipay_c">支付宝 C 类</option><option value="linked_c">自动匹配 C 类</option><option value="etf">场内 ETF</option></select></div>
-<section class="table-panel"><table><thead><tr><th>排名</th><th>标的</th><th>数据日期</th><th>最新1日</th><th>20日最大单日涨幅</th><th>7日短动量</th><th>池内分位</th><th>20日收益 / RS</th><th>MA20 / MA60</th><th>基金经理</th><th>次日情景区间</th><th>20日回撤</th><th>动作与依据</th></tr></thead><tbody id="rows">{rows}</tbody></table></section>
+<section class="table-panel"><table><thead><tr><th>排名</th><th>标的</th><th>数据日期</th><th>最新1日</th><th>20日最大单日涨幅</th><th>7日短动量</th><th>池内分位</th><th>20日收益 / RS</th><th>MA20 / MA60</th><th>基金经理</th><th>同规则回测</th><th>次日情景区间</th><th>20日回撤</th><th>动作与依据</th></tr></thead><tbody id="rows">{rows}</tbody></table></section>
 <section class="notes"><h2>T+0 日内盈利可执行性</h2><p>仅列出规则允许当日回转的代表性债券、黄金和跨境 ETF。成本门槛通过不等于盈利预测；回本涨幅还未计买卖价差、滑点和溢价风险。</p></section>
 <section class="table-panel"><table><thead><tr><th>T+0 标的</th><th>现价</th><th>当日涨跌</th><th>1 手金额</th><th>最多成交</th><th>佣金回本涨幅</th><th>结论</th></tr></thead><tbody>{intraday_rows or '<tr><td colspan="7">本次未获取到可核验的 T+0 行情。</td></tr>'}</tbody></table></section>
 <section class="notes"><h2>风控与数据状态</h2><p>总资金 {TOTAL_CAPITAL} 元，单笔加仓控制在 {BUY_MIN}～{BUY_MAX} 元。场内 ETF 按买卖各最低 {BROKER_MIN_COMMISSION:.0f} 元佣金过滤，往返成本超过 {MAX_EXCHANGE_ROUND_TRIP_COST_PCT:.1f}% 时只观察；支付宝 C 类按实时赎回费率给出最低计划持有天数，最终以购买页为准。</p>{f'<ul>{failures}</ul>' if failures else '<p>本次扫描未记录接口失败。</p>'}</section>
@@ -1434,7 +1551,7 @@ const data=JSON.parse(document.getElementById('dashboard-data').textContent); co
 function filterRows(){{const q=search.value.trim().toLowerCase(), k=kind.value; document.querySelectorAll('#rows tr').forEach(row=>{{const text=row.textContent.toLowerCase(); row.hidden=(q&&!text.includes(q))||(k!=='all'&&row.dataset.kind!==k);}});}}
 search.addEventListener('input',filterRows); kind.addEventListener('change',filterRows);
 function addText(parent,tag,text,className){{const node=document.createElement(tag); node.textContent=text; if(className)node.className=className; parent.appendChild(node); return node;}}
-function runQuery(){{const q=fundQuery.value.trim().toLowerCase(); queryResult.replaceChildren(); queryResult.classList.add('visible'); if(!q){{addText(queryResult,'p','请输入基金代码或名称。'); return;}} const matches=data.results.filter(item=>item.code.toLowerCase()===q||item.name.toLowerCase().includes(q)); if(!matches.length){{addText(queryResult,'h3','本次扫描池中没有找到'); addText(queryResult,'p','请把基金代码发给我，我可以先核验代码、费率和数据，再决定是否加入固定扫描池。'); return;}} const item=matches[0]; addText(queryResult,'h3',item.code+' · '+item.name); const grid=addText(queryResult,'div','', 'query-grid'); const holding=item.fee_free_days?('至少 '+item.fee_free_days+' 天'):(item.kind==='etf'?'1～7 天复核':'赎回前核对费率'); const manager=item.manager_years!=null?(item.manager_names+' · '+item.manager_years.toFixed(1)+' 年'):'待核验'; [['当前结论',item.action],['建议金额',(item.amount||0)+' 元'],['计划持有',holding],['基金经理',manager],['1/3/5日',item.r1.toFixed(2)+'% / '+item.r3.toFixed(2)+'% / '+item.r5.toFixed(2)+'%'],['次日情景',item.next_day_low.toFixed(2)+'% ～ '+item.next_day_high.toFixed(2)+'%'],['置信度',item.forecast_confidence],['数据日期',item.data_date]].forEach(pair=>{{const box=addText(grid,'span',pair[0]); addText(box,'b',pair[1]);}}); addText(queryResult,'p','提示：情景区间由近期波动、趋势和有限新闻标题估算，不是收益承诺。'); const newsItems=item.news_items||[]; if(newsItems.length){{const list=addText(queryResult,'ul','', 'news-list'); newsItems.forEach(news=>{{const li=document.createElement('li'); const link=document.createElement('a'); link.textContent=news.title; if(/^https?:\/\//.test(news.url)){{link.href=news.url; link.target='_blank'; link.rel='noopener noreferrer';}} li.appendChild(link); addText(li,'small',(news.source||'来源待核验')+(news.published?' · '+news.published:'')); list.appendChild(li);}});}}}}
+function runQuery(){{const q=fundQuery.value.trim().toLowerCase(); queryResult.replaceChildren(); queryResult.classList.add('visible'); if(!q){{addText(queryResult,'p','请输入基金代码或名称。'); return;}} const matches=data.results.filter(item=>item.code.toLowerCase()===q||item.name.toLowerCase().includes(q)); if(!matches.length){{addText(queryResult,'h3','本次扫描池中没有找到'); addText(queryResult,'p','请把基金代码发给我，我可以先核验代码、费率和数据，再决定是否加入固定扫描池。'); return;}} const item=matches[0]; addText(queryResult,'h3',item.code+' · '+item.name); const grid=addText(queryResult,'div','', 'query-grid'); const holding=item.fee_free_days?('至少 '+item.fee_free_days+' 天'):(item.kind==='etf'?'1～7 天复核':'赎回前核对费率'); const manager=item.manager_years!=null?(item.manager_names+' · '+item.manager_years.toFixed(1)+' 年'):'待核验'; const backtest=item.backtest_signals?('样本 '+item.backtest_signals+' 次；3/5日胜率 '+item.backtest_win3.toFixed(1)+'% / '+item.backtest_win5.toFixed(1)+'%'):'样本不足'; [['当前结论',item.action],['建议金额',(item.amount||0)+' 元'],['计划持有',holding],['基金经理',manager],['1/3/5日',item.r1.toFixed(2)+'% / '+item.r3.toFixed(2)+'% / '+item.r5.toFixed(2)+'%'],['同规则回测',backtest],['次日情景',item.next_day_low.toFixed(2)+'% ～ '+item.next_day_high.toFixed(2)+'%'],['置信度',item.forecast_confidence],['数据日期',item.data_date]].forEach(pair=>{{const box=addText(grid,'span',pair[0]); addText(box,'b',pair[1]);}}); addText(queryResult,'p','提示：情景区间由近期波动、趋势和有限新闻标题估算，不是收益承诺。'); const newsItems=item.news_items||[]; if(newsItems.length){{const list=addText(queryResult,'ul','', 'news-list'); newsItems.forEach(news=>{{const li=document.createElement('li'); const link=document.createElement('a'); link.textContent=news.title; if(/^https?:\/\//.test(news.url)){{link.href=news.url; link.target='_blank'; link.rel='noopener noreferrer';}} li.appendChild(link); addText(li,'small',(news.source||'来源待核验')+(news.published?' · '+news.published:'')); list.appendChild(li);}});}}}}
 queryButton.addEventListener('click',runQuery); fundQuery.addEventListener('keydown',event=>{{if(event.key==='Enter')runQuery();}});
 </script></main></body></html>'''
 
