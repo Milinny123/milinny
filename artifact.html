@@ -89,7 +89,7 @@
 
                 <button id="btn-open-portfolio-modal" class="px-3 py-1.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-medium shadow-md transition-all flex items-center gap-1.5">
                     <i class="fa-solid fa-camera"></i>
-                    <span class="hidden xs:inline">AI 识图持仓</span>
+                    <span class="hidden xs:inline">截图导入持仓</span>
                 </button>
                 <div class="flex items-center gap-2 bg-slate-900/90 px-3 py-1.5 rounded-xl border border-slate-800 font-mono">
                     <i class="fa-regular fa-clock text-brand-400"></i>
@@ -311,8 +311,8 @@
                     <i class="fa-solid fa-robot text-lg"></i>
                 </div>
                 <div>
-                    <h3 class="font-bold text-white text-base">Gemini AI 智能识图导入支付宝持仓</h3>
-                    <p class="text-xs text-slate-400">上传或直接按 Ctrl+V 粘贴支付宝/天天基金持仓截图，自动提取数据</p>
+                            <h3 class="font-bold text-white text-base">截图导入支付宝持仓</h3>
+                            <p class="text-xs text-slate-400">上传或按 Ctrl+V 粘贴截图作为记录参考；静态 Pages 不会伪造 OCR 识别结果</p>
                 </div>
             </div>
 
@@ -331,13 +331,13 @@
             <div id="ocr-status-container" class="hidden space-y-3 text-xs">
                 <div id="ocr-loading" class="p-6 text-center text-slate-400 animate-pulse space-y-2 bg-slate-900/80 rounded-xl">
                     <i class="fa-solid fa-circle-notch fa-spin text-2xl text-emerald-400"></i>
-                    <div>Gemini 3 Flash 正在深度解析支付宝持仓截图中的基金数据...</div>
+                    <div>正在读取截图；请使用“手动添加”确认基金代码、金额和日期...</div>
                 </div>
 
                 <div id="ocr-preview-results" class="hidden space-y-3">
                     <div class="font-bold text-emerald-400 flex items-center gap-1.5 text-xs">
                         <i class="fa-solid fa-circle-check"></i>
-                        成功识别以下持仓基金 (可在确认前调整买入日期)：
+                        截图已接收；请用“手动添加”录入并核对持仓，页面不会自动猜测代码：
                     </div>
                     <div class="overflow-x-auto">
                         <table class="w-full text-left text-xs text-slate-300">
@@ -555,25 +555,8 @@
                 loadingEl.classList.add('hidden');
                 resultsEl.classList.remove('hidden');
 
-                tempParsedOcrHoldings = [
-                    { fundName: "华夏半导体芯片ETF联接C", fundCode: "012616", holdAmount: 1200, buyDate: todayStr, totalProfit: 32.5 },
-                    { fundName: "富国中证人工智能ETF联接C", fundCode: "015874", holdAmount: 800, buyDate: todayStr, totalProfit: 15.0 }
-                ];
-
-                tbody.innerHTML = '';
-                tempParsedOcrHoldings.forEach((item, idx) => {
-                    const tr = document.createElement('tr');
-                    tr.innerHTML = `
-                        <td class="py-2 px-2 font-bold text-white">${item.fundName}</td>
-                        <td class="py-2 px-2 font-mono text-slate-400">${item.fundCode}</td>
-                        <td class="py-2 px-2 font-mono text-emerald-400 font-bold">￥${item.holdAmount}</td>
-                        <td class="py-2 px-2">
-                            <input type="date" value="${item.buyDate}" onchange="tempParsedOcrHoldings[${idx}].buyDate = this.value" class="bg-slate-900 border border-slate-700 text-xs text-white px-2 py-1 rounded font-mono focus:outline-none focus:border-emerald-500">
-                        </td>
-                        <td class="py-2 px-2 font-mono text-red-400">+￥${item.totalProfit}</td>
-                    `;
-                    tbody.appendChild(tr);
-                });
+                tempParsedOcrHoldings = [];
+                tbody.innerHTML = '<tr><td colspan="5" class="py-4 px-2 text-amber-300">截图预览完成。为避免错误映射，请关闭此窗口后使用“手动添加”录入代码、金额和买入日期。</td></tr>';
             }, 1500);
         }
 
@@ -601,7 +584,7 @@
         ];
 
         // Process momentum scores
-        let processedData = FUND_WATCHLIST.map(f => {
+        let processedData = [];
             const score = Number((f.est * 0.45 + f.ret3d * 0.30 + f.ret5d * 0.15 + f.ret20d * 0.10).toFixed(2));
             const stopLoss = f.drawdown <= -8.0;
             return { ...f, score, stopLoss };
