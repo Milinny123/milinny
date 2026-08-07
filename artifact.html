@@ -591,6 +591,8 @@
                 const response = await fetch('index.html?data=' + Date.now(), { cache: 'no-store' });
                 if (!response.ok) throw new Error('实时仪表盘数据请求失败');
                 const page = await response.text();
+                // Escape the closing tag inside this inline script so the HTML parser
+                // does not terminate the script before the regex runs.
                 const match = page.match(/<script type="application\/json" id="dashboard-data">([\s\S]*?)<\/script>/);
                 if (!match) throw new Error('未找到 dashboard-data');
                 const payload = JSON.parse(match[1]);
