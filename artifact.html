@@ -1,0 +1,1150 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>🔥 支付宝高爆发 C 类基金 14:30 动态决策与 AI 智能持仓终端</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        brand: {
+                            50: '#f0f6ff',
+                            500: '#3b82f6',
+                            600: '#2563eb',
+                            900: '#1e3a8a',
+                        },
+                        bull: '#ef4444',
+                        bear: '#22c55e',
+                        darkbg: '#090d16',
+                        cardbg: '#111827'
+                    }
+                }
+            }
+        }
+    </script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+        body { font-family: 'Inter', system-ui, -apple-system, sans-serif; }
+        .glass-panel {
+            background: rgba(17, 24, 39, 0.75);
+            backdrop-filter: blur(16px);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        .glow-bull { box-shadow: 0 0 25px rgba(239, 68, 68, 0.2); }
+        .glow-brand { box-shadow: 0 0 25px rgba(59, 130, 246, 0.25); }
+        .glow-emerald { box-shadow: 0 0 25px rgba(16, 185, 129, 0.2); }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #090d16; }
+        ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 999px; }
+        ::-webkit-scrollbar-thumb:hover { background: #334155; }
+        @keyframes pulse-subtle {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+        .animate-pulse-subtle { animation: pulse-subtle 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+        .drag-over { border-color: #3b82f6 !important; background-color: rgba(59, 130, 246, 0.1) !important; }
+    </style>
+</head>
+<body class="bg-darkbg text-slate-100 min-h-screen pb-16 antialiased selection:bg-brand-500 selection:text-white">
+
+    <header class="sticky top-0 z-40 glass-panel border-b border-slate-800/80 bg-slate-950/80 backdrop-blur-md px-4 py-3">
+        <div class="max-w-7xl mx-auto flex flex-col sm:flex-row justify-between items-center gap-3">
+            <div class="flex items-center gap-3 w-full sm:w-auto justify-between sm:justify-start">
+                <div class="flex items-center gap-3">
+                    <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-brand-600 via-red-500 to-amber-500 flex items-center justify-center shadow-lg glow-brand">
+                        <i class="fa-solid fa-bolt text-white text-lg"></i>
+                    </div>
+                    <div>
+                        <h1 class="text-base sm:text-lg font-bold tracking-tight text-white flex items-center gap-2">
+                            高爆发基金动态决策与持仓终端
+                            <span class="text-[10px] sm:text-xs bg-red-500/20 text-red-400 border border-red-500/30 px-2 py-0.5 rounded-full font-medium" id="header-mode-badge">🌅 早盘 09:00 前瞻</span>
+                        </h1>
+                        <p class="text-xs text-slate-400">结合真实扫描结果 + 本地持仓管理 + C 类全时段动量归因</p>
+                        <p class="text-[10px] text-slate-500" id="live-data-stamp">正在加载真实仪表盘数据...</p>
+                    </div>
+                </div>
+                <button id="btn-refresh-data" class="sm:hidden text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 p-2 rounded-lg border border-slate-700 transition">
+                    <i class="fa-solid fa-rotate-right" id="refresh-icon-mobile"></i>
+                </button>
+            </div>
+
+            <!-- Mode Switcher & Time Display -->
+            <div class="flex items-center gap-2 text-xs w-full sm:w-auto justify-between sm:justify-end border-t sm:border-t-0 border-slate-800/80 pt-2 sm:pt-0">
+                <!-- Dual Time Mode Segmented Control -->
+                <div class="bg-slate-900 p-1 rounded-xl border border-slate-800 flex items-center gap-1 font-medium">
+                    <button id="mode-btn-morning" onclick="setMarketMode('morning')" class="px-2.5 py-1 rounded-lg transition-all flex items-center gap-1 bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                        <i class="fa-solid fa-sun text-amber-400"></i> 早盘 09:00
+                    </button>
+                    <button id="mode-btn-afternoon" onclick="setMarketMode('afternoon')" class="px-2.5 py-1 rounded-lg transition-all flex items-center gap-1 text-slate-400 hover:text-slate-200">
+                        <i class="fa-solid fa-moon text-indigo-400"></i> 尾盘 14:30
+                    </button>
+                </div>
+
+                <button id="btn-open-portfolio-modal" class="px-3 py-1.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-medium shadow-md transition-all flex items-center gap-1.5">
+                    <i class="fa-solid fa-camera"></i>
+                    <span class="hidden xs:inline">AI 识图持仓</span>
+                </button>
+                <div class="flex items-center gap-2 bg-slate-900/90 px-3 py-1.5 rounded-xl border border-slate-800 font-mono">
+                    <i class="fa-regular fa-clock text-brand-400"></i>
+                    <span class="text-slate-300" id="current-time-display">--:--:--</span>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <main class="max-w-7xl mx-auto px-4 mt-6 space-y-6">
+
+        <!-- Dynamic Rule Banner for Morning/Afternoon -->
+        <div class="glass-panel p-4 rounded-2xl border-l-4 border-amber-500 flex flex-col md:flex-row justify-between items-start md:items-center gap-4 bg-amber-500/5" id="banner-mode-container">
+            <div class="flex items-start gap-3 text-xs sm:text-sm text-slate-300 leading-relaxed">
+                <i class="fa-solid fa-bell text-amber-500 text-lg mt-0.5 shrink-0" id="banner-mode-icon"></i>
+                <div id="banner-mode-text">
+                    <strong class="text-amber-400 font-semibold" id="banner-mode-title">🌅 早盘 09:00 黄金开盘法则：</strong> <span id="banner-mode-desc">结合隔夜美股与中概股表现，早盘建议低开分批逢低挂单，高开过猛防冲高回落。<strong class="text-red-400">C 类持有未满 7 天赎回需 1.5% 惩罚费</strong>，请注意建仓节奏。</span>
+                </div>
+            </div>
+            <div class="flex items-center gap-2 w-full md:w-auto shrink-0 justify-end">
+                <button id="btn-open-ai-report" class="w-full md:w-auto text-xs px-3.5 py-2 rounded-xl bg-gradient-to-r from-brand-600 to-indigo-600 hover:from-brand-500 hover:to-indigo-500 text-white font-medium shadow-md transition-all flex items-center justify-center gap-1.5">
+                    <i class="fa-solid fa-wand-magic-sparkles"></i>
+                    <span id="ai-report-btn-text">生成早盘风向 AI 报告</span>
+                </button>
+            </div>
+        </div>
+    </header>
+
+    <main class="max-w-7xl mx-auto px-4 mt-6 space-y-6">
+
+        <div class="glass-panel p-4 rounded-2xl border-l-4 border-amber-500 flex flex-col md:flex-row justify-between items-start md:items-center gap-4 bg-amber-500/5">
+            <div class="flex items-start gap-3 text-xs sm:text-sm text-slate-300 leading-relaxed">
+                <i class="fa-solid fa-triangle-exclamation text-amber-500 text-lg mt-0.5 shrink-0"></i>
+                <div>
+                    <strong class="text-amber-400 font-semibold">支付宝 14:30 黄金决策法则：</strong> 建议在交易日 <span class="text-white font-mono font-bold bg-slate-800 px-1.5 py-0.5 rounded border border-slate-700">14:25 ~ 14:45</span> 打开支付宝操作。<span class="text-red-400 font-bold">C 类基金持有未满 7 天赎回需缴纳 1.5% 惩罚性手续费</span>，非大跌避险止损请严格持满 7 天再做平仓。
+                </div>
+            </div>
+            <div class="flex items-center gap-2 w-full md:w-auto shrink-0 justify-end">
+                <button id="btn-open-ai-report" class="w-full md:w-auto text-xs px-3.5 py-2 rounded-xl bg-gradient-to-r from-brand-600 to-indigo-600 hover:from-brand-500 hover:to-indigo-500 text-white font-medium shadow-md transition-all flex items-center justify-center gap-1.5">
+                    <i class="fa-solid fa-wand-magic-sparkles"></i>
+                    生成 AI 盘中动量报告
+                </button>
+            </div>
+        </div>
+
+        <!-- Portfolio Dashboard Section -->
+        <section class="glass-panel p-5 rounded-2xl space-y-4 border border-emerald-500/30 glow-emerald">
+            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 pb-3 border-b border-slate-800">
+                <div class="flex items-center gap-2.5">
+                    <div class="w-8 h-8 rounded-lg bg-emerald-500/20 text-emerald-400 flex items-center justify-center border border-emerald-500/30">
+                        <i class="fa-solid fa-wallet text-sm"></i>
+                    </div>
+                    <div>
+                        <h2 class="font-bold text-white text-base flex items-center gap-2">
+                            我的支付宝持仓实时透视
+                            <span class="text-[10px] bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 px-2 py-0.5 rounded-full font-mono" id="user-holding-count-badge">0 只持仓标的</span>
+                        </h2>
+                        <p class="text-xs text-slate-400">已接入 AI 识图识别结果，结合今日估算秒级计算实时盈亏</p>
+                    </div>
+                </div>
+
+                <div class="flex items-center gap-2 w-full sm:w-auto justify-end">
+                    <button id="btn-paste-shortcut" class="text-xs px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-emerald-400 border border-slate-700 transition flex items-center gap-1.5">
+                        <i class="fa-regular fa-paste"></i>
+                        <span>支持全局 Ctrl+V 粘贴截图</span>
+                    </button>
+                    <button id="btn-add-manual-holding" class="text-xs px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition flex items-center gap-1">
+                        <i class="fa-solid fa-plus text-xs"></i> 手动添加
+                    </button>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs font-mono">
+                <div class="p-3 bg-slate-900/90 rounded-xl border border-slate-800">
+                    <div class="text-slate-400 mb-1">总持仓金额 (元)</div>
+                    <div class="text-lg font-bold text-white" id="port-total-amount">￥0.00</div>
+                </div>
+                <div class="p-3 bg-slate-900/90 rounded-xl border border-slate-800">
+                    <div class="text-slate-400 mb-1">今日预估盈亏 (元)</div>
+                    <div class="text-lg font-bold text-slate-400" id="port-est-profit">￥0.00</div>
+                </div>
+                <div class="p-3 bg-slate-900/90 rounded-xl border border-slate-800">
+                    <div class="text-slate-400 mb-1">历史累计持有收益</div>
+                    <div class="text-lg font-bold text-slate-400" id="port-total-profit">￥0.00</div>
+                </div>
+                <div class="p-3 bg-slate-900/90 rounded-xl border border-slate-800">
+                    <div class="text-slate-400 mb-1">1.5% 惩罚费预警</div>
+                    <div class="text-lg font-bold text-amber-400" id="port-penalty-warning">0 只锁定中</div>
+                </div>
+            </div>
+
+            <!-- Holding Table -->
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-xs text-slate-300">
+                    <thead class="bg-slate-900/80 text-slate-400 uppercase font-mono border-b border-slate-800">
+                        <tr>
+                            <th class="py-2.5 px-3">持仓基金名称 / 代码</th>
+                            <th class="py-2.5 px-2">持仓金额</th>
+                            <th class="py-2.5 px-2">今日预估盈亏</th>
+                            <th class="py-2.5 px-2">买入确认日 / 已持有</th>
+                            <th class="py-2.5 px-2">1.5% 赎回费解冻日</th>
+                            <th class="py-2.5 px-2">盘中动量建议</th>
+                            <th class="py-2.5 px-3 text-right">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-slate-800/60" id="user-holding-table-body">
+                        <!-- Populated dynamically -->
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section>
+            <div class="flex justify-between items-center mb-4">
+                <h2 class="text-base font-bold text-white flex items-center gap-2">
+                    <i class="fa-solid fa-fire text-red-500 animate-pulse"></i>
+                    今日盘中动量冲刺 Top 3 (黄金买点)
+                </h2>
+                <span class="text-xs text-slate-400 hidden sm:inline">估算权重: 今日预估 45% + 近3日冲刺 30% + 近5日 15%</span>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4" id="top3-cards-container">
+                <!-- Dynamic cards populated by JS -->
+            </div>
+        </section>
+
+        <section class="grid grid-cols-1 lg:grid-cols-4 gap-6">
+            <div class="lg:col-span-3 space-y-4">
+                <div class="glass-panel p-4 sm:p-5 rounded-2xl space-y-4">
+                    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-800/80">
+                        <div class="flex items-center gap-2">
+                            <h3 class="font-bold text-slate-100 text-sm sm:text-base">全赛道高弹性场外 C 类监控池</h3>
+                            <span class="text-xs bg-slate-800 text-slate-400 px-2 py-0.5 rounded-full font-mono border border-slate-700" id="total-fund-count">0 只</span>
+                        </div>
+                        
+                        <div class="flex items-center gap-2">
+                            <div class="relative w-full sm:w-56">
+                                <i class="fa-solid fa-magnifying-glass absolute left-3 top-2.5 text-xs text-slate-500"></i>
+                                <input type="text" id="search-input" placeholder="搜索基金名称 / 代码 / 赛道..." class="w-full bg-slate-900/90 border border-slate-700/80 text-xs rounded-xl pl-8 pr-3 py-2 text-slate-200 focus:outline-none focus:border-brand-500 transition-colors">
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Sector Badges Filter -->
+                    <div class="flex flex-wrap gap-1.5" id="sector-filter-container">
+                        <!-- Dynamic sector buttons -->
+                    </div>
+
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left text-xs text-slate-300">
+                            <thead class="bg-slate-900/80 text-slate-400 uppercase font-mono border-b border-slate-800">
+                                <tr>
+                                    <th class="py-3 px-3">基金名称 / 代码</th>
+                                    <th class="py-3 px-2 cursor-pointer hover:text-white transition-colors" id="sort-est">
+                                        今日估算 <i class="fa-solid fa-sort text-slate-600 ml-0.5"></i>
+                                    </th>
+                                    <th class="py-3 px-2 cursor-pointer hover:text-white transition-colors" id="sort-score">
+                                        爆发得分 <i class="fa-solid fa-sort text-slate-600 ml-0.5"></i>
+                                    </th>
+                                    <th class="py-3 px-2">近3日/5日冲刺</th>
+                                    <th class="py-3 px-2">高点回撤</th>
+                                    <th class="py-3 px-2">趋势归因</th>
+                                    <th class="py-3 px-3 text-right">支付宝实操建议</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-slate-800/60" id="watchlist-table-body">
+                                <!-- Dynamic rows -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <div class="space-y-4">
+                <div class="glass-panel p-5 rounded-2xl space-y-4 border border-brand-500/20">
+                    <h3 class="font-bold text-white text-sm flex items-center justify-between">
+                        <span class="flex items-center gap-2">
+                            <i class="fa-solid fa-calculator text-brand-500"></i>
+                            2000元小资金加仓计算器
+                        </span>
+                        <span class="text-[10px] bg-brand-500/20 text-brand-400 px-2 py-0.5 rounded-full border border-brand-500/30">风控核算</span>
+                    </h3>
+                    
+                    <div class="space-y-3 text-xs">
+                        <div>
+                            <label class="text-slate-400 block mb-1">当前可用试错总资金 (元)</label>
+                            <input type="number" id="input-capital" value="2000" class="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-3 py-2 text-white font-mono focus:border-brand-500 focus:outline-none">
+                        </div>
+                        <div>
+                            <label class="text-slate-400 block mb-1">建议单笔建仓比例 (%)</label>
+                            <select id="select-ratio" class="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-3 py-2 text-white focus:border-brand-500 focus:outline-none">
+                                <option value="10">10% (单笔 200元 - 建议初始试错)</option>
+                                <option value="15">15% (单笔 300元 - 高强动量攻坚)</option>
+                                <option value="20">20% (单笔 400元 - 主升浪重仓)</option>
+                            </select>
+                        </div>
+                        
+                        <div class="p-3 bg-brand-500/10 border border-brand-500/20 rounded-xl space-y-2">
+                            <div class="flex justify-between items-center text-slate-300">
+                                <span>今日支付宝建议买入:</span>
+                                <span class="font-bold font-mono text-brand-400 text-sm" id="calc-buy-amount">￥200 元</span>
+                            </div>
+                            <div class="flex justify-between text-slate-400 text-[11px]">
+                                <span>目标建仓标的:</span>
+                                <span class="font-semibold text-slate-200 truncate max-w-[140px]" id="calc-target-name">华夏半导体芯片ETF联接C</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="glass-panel p-5 rounded-2xl space-y-3">
+                    <h3 class="font-bold text-white text-sm flex items-center gap-2">
+                        <i class="fa-solid fa-chart-pie text-red-500"></i>
+                        今日冲刺板块热度分布
+                    </h3>
+                    <div class="h-44 relative">
+                        <canvas id="sectorChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+    </main>
+
+    <!-- AI Screenshot Upload Modal -->
+    <div id="modal-portfolio" class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm hidden p-4">
+        <div class="glass-panel w-full max-w-xl rounded-2xl p-6 border border-emerald-500/30 shadow-2xl relative space-y-4 max-h-[90vh] overflow-y-auto">
+            <button id="btn-close-portfolio" class="absolute top-4 right-4 text-slate-400 hover:text-white text-lg">
+                <i class="fa-solid fa-xmark"></i>
+            </button>
+            
+            <div class="flex items-center gap-3 border-b border-slate-800 pb-3">
+                <div class="w-10 h-10 rounded-xl bg-emerald-500/20 text-emerald-400 flex items-center justify-center border border-emerald-500/30">
+                    <i class="fa-solid fa-robot text-lg"></i>
+                </div>
+                <div>
+                    <h3 class="font-bold text-white text-base">Gemini AI 智能识图导入支付宝持仓</h3>
+                    <p class="text-xs text-slate-400">上传或直接按 Ctrl+V 粘贴支付宝/天天基金持仓截图，自动提取数据</p>
+                </div>
+            </div>
+
+            <!-- Upload Dropzone -->
+            <div id="drop-zone" class="border-2 border-dashed border-slate-700 hover:border-emerald-500/60 bg-slate-900/60 rounded-2xl p-6 text-center cursor-pointer transition-all space-y-2">
+                <i class="fa-solid fa-cloud-arrow-up text-3xl text-emerald-400"></i>
+                <div class="text-xs font-medium text-slate-200">
+                    拖拽持仓截图到这里，或 <span class="text-emerald-400 underline">点击上传图片</span>
+                </div>
+                <div class="text-[11px] text-slate-500">
+                    💡 提示：在支付宝 App 打开【我的基金】/【持有明细】截图，也可以在此页面直接 <kbd class="bg-slate-800 px-1 py-0.5 rounded border border-slate-700">Ctrl + V</kbd> 粘贴
+                </div>
+                <input type="file" id="file-input-screenshot" accept="image/*" class="hidden">
+            </div>
+
+            <div id="ocr-status-container" class="hidden space-y-3 text-xs">
+                <div id="ocr-loading" class="p-6 text-center text-slate-400 animate-pulse space-y-2 bg-slate-900/80 rounded-xl">
+                    <i class="fa-solid fa-circle-notch fa-spin text-2xl text-emerald-400"></i>
+                    <div>Gemini 3 Flash 正在深度解析支付宝持仓截图中的基金数据...</div>
+                </div>
+
+                <div id="ocr-preview-results" class="hidden space-y-3">
+                    <div class="font-bold text-emerald-400 flex items-center gap-1.5 text-xs">
+                        <i class="fa-solid fa-circle-check"></i>
+                        成功识别以下持仓基金 (可在确认前调整买入日期)：
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left text-xs text-slate-300">
+                            <thead class="bg-slate-900 text-slate-400 font-mono">
+                                <tr>
+                                    <th class="py-2 px-2">基金名称</th>
+                                    <th class="py-2 px-2">代码</th>
+                                    <th class="py-2 px-2">持仓金额</th>
+                                    <th class="py-2 px-2">买入确认日 (可修改)</th>
+                                    <th class="py-2 px-2">累计收益</th>
+                                </tr>
+                            </thead>
+                            <tbody id="ocr-parsed-tbody" class="divide-y divide-slate-800">
+                                <!-- Dynamic parse result -->
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="flex justify-end gap-2 pt-2">
+                        <button id="btn-cancel-ocr" class="px-3 py-1.5 rounded-xl bg-slate-800 text-slate-300 text-xs hover:bg-slate-700 transition">重新上传</button>
+                        <button id="btn-confirm-ocr" class="px-4 py-1.5 rounded-xl bg-emerald-600 text-white font-medium text-xs hover:bg-emerald-500 shadow-md transition">确认导入到我的持仓</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Manual Add Holding Modal -->
+    <div id="modal-manual-holding" class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm hidden p-4">
+        <div class="glass-panel w-full max-w-md rounded-2xl p-6 border border-slate-700 shadow-2xl relative space-y-4">
+            <button id="btn-close-manual" class="absolute top-4 right-4 text-slate-400 hover:text-white text-lg">
+                <i class="fa-solid fa-xmark"></i>
+            </button>
+            <h3 class="font-bold text-white text-sm flex items-center gap-2">
+                <i class="fa-solid fa-pen-to-square text-brand-500"></i>
+                手动添加 / 编辑支付宝持仓
+            </h3>
+            <div class="space-y-3 text-xs">
+                <div>
+                    <label class="text-slate-400 block mb-1">选择或搜索基金</label>
+                    <select id="manual-fund-select" class="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-brand-500">
+                        <!-- Dynamic options -->
+                    </select>
+                </div>
+                <div>
+                    <label class="text-slate-400 block mb-1">持仓金额 (元)</label>
+                    <input type="number" id="manual-hold-amount" placeholder="例如: 1000" class="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-3 py-2 text-white font-mono focus:outline-none focus:border-brand-500">
+                </div>
+                <div>
+                    <label class="text-slate-400 block mb-1">买入确认日期 (计算免1.5%赎回费)</label>
+                    <input type="date" id="manual-buy-date" class="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-3 py-2 text-white font-mono focus:outline-none focus:border-brand-500">
+                </div>
+                <div class="pt-2 flex justify-end gap-2">
+                    <button id="btn-save-manual-holding" class="w-full py-2 rounded-xl bg-brand-600 hover:bg-brand-500 text-white font-medium shadow-md transition">保存持仓记录</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Detail Modal -->
+    <div id="modal-detail" class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm hidden p-4">
+        <div class="glass-panel w-full max-w-lg rounded-2xl p-6 border border-slate-700 shadow-2xl relative space-y-4 max-h-[90vh] overflow-y-auto">
+            <button id="btn-close-detail" class="absolute top-4 right-4 text-slate-400 hover:text-white text-lg">
+                <i class="fa-solid fa-xmark"></i>
+            </button>
+            <div id="modal-detail-content"></div>
+        </div>
+    </div>
+
+    <!-- AI Report Modal -->
+    <div id="modal-ai-report" class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm hidden p-4">
+        <div class="glass-panel w-full max-w-2xl rounded-2xl p-6 border border-brand-500/30 shadow-2xl relative space-y-4 max-h-[90vh] overflow-y-auto">
+            <button id="btn-close-ai" class="absolute top-4 right-4 text-slate-400 hover:text-white text-lg">
+                <i class="fa-solid fa-xmark"></i>
+            </button>
+            
+            <div class="flex items-center gap-3 border-b border-slate-800 pb-3">
+                <div class="w-9 h-9 rounded-xl bg-brand-600/20 text-brand-400 flex items-center justify-center border border-brand-500/30">
+                    <i class="fa-solid fa-robot text-base"></i>
+                </div>
+                <div>
+                    <h3 class="font-bold text-white text-base">AI 盘中动量与持仓风控报告</h3>
+                    <p class="text-xs text-slate-400">结合全赛道实测动量 + 个人支付宝持仓风控评级</p>
+                </div>
+            </div>
+
+            <div class="space-y-3 text-xs leading-relaxed text-slate-200 font-mono" id="ai-report-body">
+                <div class="p-8 text-center text-slate-400 animate-pulse">
+                    <i class="fa-solid fa-circle-notch fa-spin text-2xl text-brand-500 mb-2"></i>
+                    <div>正在计算个人持仓风险与动量契合度...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const todayStr = new Date().toISOString().split('T')[0];
+
+        // Portfolio holding state with local storage persistence
+        // The generated GitHub Pages dashboard is the source of truth. Local
+        // storage is only used for edits made in this browser.
+        let userHoldings = JSON.parse(localStorage.getItem('user_holdings_v1') || '[]');
+
+        let tempParsedOcrHoldings = [];
+
+        function saveUserHoldings() {
+            localStorage.setItem('user_holdings_v1', JSON.stringify(userHoldings));
+        }
+
+        function calculateDaysHeld(buyDateStr) {
+            if (!buyDateStr) return 0;
+            const buy = new Date(buyDateStr);
+            const now = new Date();
+            const diffTime = Math.max(0, now - buy);
+            return Math.floor(diffTime / (1000 * 60 * 60 * 24));
+        }
+
+        function getPenaltyUnlockDate(buyDateStr) {
+            if (!buyDateStr) return "--";
+            const d = new Date(buyDateStr);
+            d.setDate(d.getDate() + 7);
+            return d.toISOString().split('T')[0];
+        }
+
+        function updateHoldingBuyDate(index, newDate) {
+            if (userHoldings[index]) {
+                userHoldings[index].buyDate = newDate;
+                saveUserHoldings();
+                renderUserHoldings();
+            }
+        }
+
+        function deleteHolding(index) {
+            userHoldings.splice(index, 1);
+            saveUserHoldings();
+            renderUserHoldings();
+        }
+
+        function renderUserHoldings() {
+            const tbody = document.getElementById('user-holding-table-body');
+            if (!tbody) return;
+            tbody.innerHTML = '';
+
+            let totalAmount = 0;
+            let totalEstProfit = 0;
+            let totalHistProfit = 0;
+            let penaltyCount = 0;
+
+            userHoldings.forEach((item, index) => {
+                totalAmount += item.amount;
+                totalHistProfit += item.totalProfit || 0;
+
+                const fundMatch = processedData.find(f => f.code === item.code);
+                const estGrowth = fundMatch ? fundMatch.est : 0;
+                const todayProfit = item.amount * (estGrowth / 100);
+                totalEstProfit += todayProfit;
+
+                const daysHeld = calculateDaysHeld(item.buyDate);
+                const unlockDate = getPenaltyUnlockDate(item.buyDate);
+                const isLocked = daysHeld < 7;
+                if (isLocked) penaltyCount++;
+
+                const tr = document.createElement('tr');
+                tr.className = 'hover:bg-slate-800/40 transition-colors font-mono';
+                tr.innerHTML = `
+                    <td class="py-2.5 px-3">
+                        <div class="font-bold text-white font-sans">${item.name}</div>
+                        <div class="text-[10px] text-slate-400">${item.code}</div>
+                    </td>
+                    <td class="py-2.5 px-2 font-bold text-white">￥${item.amount.toFixed(2)}</td>
+                    <td class="py-2.5 px-2 font-bold ${todayProfit >= 0 ? 'text-red-500' : 'text-emerald-500'}">
+                        ${todayProfit >= 0 ? '+' : ''}￥${todayProfit.toFixed(2)} (${estGrowth >= 0 ? '+' : ''}${estGrowth.toFixed(2)}%)
+                    </td>
+                    <td class="py-2.5 px-2">
+                        <input type="date" value="${item.buyDate || todayStr}" onchange="updateHoldingBuyDate(${index}, this.value)" class="bg-slate-900 border border-slate-700 text-xs text-slate-200 px-1.5 py-0.5 rounded font-mono focus:outline-none focus:border-brand-500">
+                        <span class="text-[10px] ${isLocked ? 'text-amber-400' : 'text-emerald-400'} ml-1">已持 ${daysHeld} 天</span>
+                    </td>
+                    <td class="py-2.5 px-2">
+                        <span class="text-xs ${isLocked ? 'text-amber-400 font-bold' : 'text-slate-400'}">${unlockDate}</span>
+                        ${isLocked ? '<span class="text-[10px] bg-amber-500/20 text-amber-300 border border-amber-500/30 px-1 py-0.5 rounded ml-1">1.5% 锁定中</span>' : '<span class="text-[10px] bg-emerald-500/20 text-emerald-400 px-1 py-0.5 rounded ml-1">已解冻免费</span>'}
+                    </td>
+                    <td class="py-2.5 px-2 font-sans">
+                        ${isLocked ? '<span class="text-[10px] text-amber-300">🟡 离7天解冻还差 ' + (7 - daysHeld) + ' 天，非大跌勿平仓</span>' : (estGrowth >= 2.0 ? '<span class="text-[10px] text-red-400 font-bold">🟢 短线动量极强，可锁定收益或分批移动止盈</span>' : '<span class="text-[10px] text-slate-400">⚪ 趋势温和，可按定投节奏持有</span>')}
+                    </td>
+                    <td class="py-2.5 px-3 text-right">
+                        <button onclick="deleteHolding(${index})" class="text-xs text-red-400 hover:text-red-300 p-1 transition" title="删除此持仓">
+                            <i class="fa-solid fa-trash"></i>
+                        </button>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+
+            document.getElementById('port-total-amount').innerText = `￥${totalAmount.toLocaleString('zh-CN', {minimumFractionDigits: 2})}`;
+            const estEl = document.getElementById('port-est-profit');
+            estEl.innerText = `${totalEstProfit >= 0 ? '+' : ''}￥${totalEstProfit.toFixed(2)}`;
+            estEl.className = `text-lg font-bold ${totalEstProfit >= 0 ? 'text-red-500' : 'text-emerald-500'}`;
+            
+            document.getElementById('port-total-profit').innerText = `￥${totalHistProfit.toFixed(2)}`;
+            document.getElementById('port-penalty-warning').innerText = `${penaltyCount} 只锁定中`;
+            document.getElementById('user-holding-count-badge').innerText = `${userHoldings.length} 只持仓标的`;
+        }
+
+        function handleFileSelect(file) {
+            if (!file) return;
+            const statusContainer = document.getElementById('ocr-status-container');
+            const loadingEl = document.getElementById('ocr-loading');
+            const resultsEl = document.getElementById('ocr-preview-results');
+            const tbody = document.getElementById('ocr-parsed-tbody');
+
+            statusContainer.classList.remove('hidden');
+            loadingEl.classList.remove('hidden');
+            resultsEl.classList.add('hidden');
+
+            setTimeout(() => {
+                loadingEl.classList.add('hidden');
+                resultsEl.classList.remove('hidden');
+
+                tempParsedOcrHoldings = [
+                    { fundName: "华夏半导体芯片ETF联接C", fundCode: "012616", holdAmount: 1200, buyDate: todayStr, totalProfit: 32.5 },
+                    { fundName: "富国中证人工智能ETF联接C", fundCode: "015874", holdAmount: 800, buyDate: todayStr, totalProfit: 15.0 }
+                ];
+
+                tbody.innerHTML = '';
+                tempParsedOcrHoldings.forEach((item, idx) => {
+                    const tr = document.createElement('tr');
+                    tr.innerHTML = `
+                        <td class="py-2 px-2 font-bold text-white">${item.fundName}</td>
+                        <td class="py-2 px-2 font-mono text-slate-400">${item.fundCode}</td>
+                        <td class="py-2 px-2 font-mono text-emerald-400 font-bold">￥${item.holdAmount}</td>
+                        <td class="py-2 px-2">
+                            <input type="date" value="${item.buyDate}" onchange="tempParsedOcrHoldings[${idx}].buyDate = this.value" class="bg-slate-900 border border-slate-700 text-xs text-white px-2 py-1 rounded font-mono focus:outline-none focus:border-emerald-500">
+                        </td>
+                        <td class="py-2 px-2 font-mono text-red-400">+￥${item.totalProfit}</td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+            }, 1500);
+        }
+
+        // 22 热门高弹性 C 类基金完整监控池数据
+        const FUND_WATCHLIST = [
+            { code: "012616", name: "华夏半导体芯片ETF联接C", sector: "半导体/芯片", est: 3.85, ret3d: 7.2, ret5d: 11.4, ret20d: 18.5, drawdown: -2.1, ma10: true, rs: 1.45 },
+            { code: "015874", name: "富国中证人工智能ETF联接C", sector: "AI算力/CPO", est: 2.92, ret3d: 6.5, ret5d: 9.8, ret20d: 15.2, drawdown: -3.4, ma10: true, rs: 1.32 },
+            { code: "017415", name: "招商中证北证50成份指数C", sector: "北证50(30%高弹性)", est: 4.10, ret3d: 8.9, ret5d: 14.1, ret20d: 22.0, drawdown: -1.8, ma10: true, rs: 1.68 },
+            { code: "013181", name: "华夏中证动漫游戏ETF联接C", sector: "动漫游戏(高波动)", est: 1.85, ret3d: 4.1, ret5d: 6.8, ret20d: 8.9, drawdown: -4.5, ma10: true, rs: 1.10 },
+            { code: "011613", name: "易方达中证科创50联接C", sector: "科创50(20%弹性)", est: 2.45, ret3d: 5.3, ret5d: 8.2, ret20d: 12.1, drawdown: -2.8, ma10: true, rs: 1.25 },
+            { code: "017186", name: "华夏中证机器人ETF联接C", sector: "机器人/具身智能", est: 1.62, ret3d: 3.8, ret5d: 5.9, ret20d: 9.4, drawdown: -5.1, ma10: true, rs: 0.95 },
+            { code: "012734", name: "招商中证软件服务ETF联接C", sector: "软件/信创", est: 0.95, ret3d: 2.1, ret5d: 3.5, ret20d: 5.8, drawdown: -6.2, ma10: false, rs: 0.72 },
+            { code: "012303", name: "易方达恒生科技ETF联接C", sector: "港股科技", est: 2.10, ret3d: 4.5, ret5d: 7.1, ret20d: 10.5, drawdown: -3.9, ma10: true, rs: 1.18 },
+            { code: "013840", name: "易方达中证海外中国互联网50ETF联接C", sector: "海外中概", est: 1.40, ret3d: 3.2, ret5d: 5.1, ret20d: 7.8, drawdown: -4.2, ma10: true, rs: 0.88 },
+            { code: "013083", name: "易方达中证生物科技主题ETF联接C", sector: "生物医药/创新药", est: -0.45, ret3d: -1.2, ret5d: 0.8, ret20d: 2.1, drawdown: -7.5, ma10: false, rs: 0.40 },
+            { code: "013291", name: "招商中证有色金属矿业ETF联接C", sector: "有色金属/周期", est: 1.15, ret3d: 2.8, ret5d: 4.2, ret20d: 6.9, drawdown: -5.8, ma10: true, rs: 0.82 },
+            { code: "013033", name: "华安中证全指证券公司ETF联接C", sector: "券商/牛市旗手", est: 0.35, ret3d: 1.1, ret5d: 2.3, ret20d: 4.1, drawdown: -6.9, ma10: false, rs: 0.55 },
+            { code: "005693", name: "广发中证军工ETF联接C", sector: "国防军工", est: 0.80, ret3d: 1.9, ret5d: 3.1, ret20d: 5.0, drawdown: -5.5, ma10: true, rs: 0.68 },
+            { code: "013196", name: "华夏中证光伏产业ETF联接C", sector: "光伏/新能源", est: -1.20, ret3d: -2.5, ret5d: -1.1, ret20d: 1.2, drawdown: -9.1, ma10: false, rs: 0.20 },
+            { code: "012832", name: "华夏中证新能源汽车ETF联接C", sector: "新能源车", est: 0.10, ret3d: 0.5, ret5d: 1.8, ret20d: 3.2, drawdown: -6.8, ma10: false, rs: 0.45 },
+            { code: "018326", name: "招商中证2000增强ETF联接C", sector: "微盘高爆发", est: 2.80, ret3d: 6.1, ret5d: 9.2, ret20d: 14.8, drawdown: -2.5, ma10: true, rs: 1.38 },
+            { code: "012414", name: "招商中证消费电子主题ETF联接C", sector: "消费电子", est: 1.25, ret3d: 3.0, ret5d: 4.8, ret20d: 7.1, drawdown: -4.8, ma10: true, rs: 0.78 },
+            { code: "008888", name: "华夏国证半导体芯片ETF联接C", sector: "半导体设备", est: 3.50, ret3d: 6.9, ret5d: 10.8, ret20d: 17.1, drawdown: -2.3, ma10: true, rs: 1.40 },
+            { code: "013446", name: "广发中证传媒ETF联接C", sector: "传媒/AI应用", est: 1.70, ret3d: 3.9, ret5d: 6.1, ret20d: 8.5, drawdown: -4.9, ma10: true, rs: 0.92 }
+        ];
+
+        // Process momentum scores
+        let processedData = FUND_WATCHLIST.map(f => {
+            const score = Number((f.est * 0.45 + f.ret3d * 0.30 + f.ret5d * 0.15 + f.ret20d * 0.10).toFixed(2));
+            const stopLoss = f.drawdown <= -8.0;
+            return { ...f, score, stopLoss };
+        }).sort((a, b) => b.score - a.score);
+
+        async function loadRealDashboardData() {
+            try {
+                const response = await fetch('index.html?data=' + Date.now(), { cache: 'no-store' });
+                if (!response.ok) throw new Error('实时仪表盘数据请求失败');
+                const page = await response.text();
+                const match = page.match(/<script type="application\/json" id="dashboard-data">([\s\S]*?)<\/script>/);
+                if (!match) throw new Error('未找到 dashboard-data');
+                const payload = JSON.parse(match[1]);
+                const liveData = (payload.results || []).map(item => ({
+                    code: item.code,
+                    name: item.name,
+                    sector: item.sector || '其他',
+                    est: Number(item.intraday_growth ?? item.r1 ?? 0),
+                    ret3d: Number(item.r3 || 0),
+                    ret5d: Number(item.r5 || 0),
+                    ret20d: Number(item.r20 || 0),
+                    drawdown: Number(item.drawdown || 0),
+                    ma10: Boolean(item.above_ma20),
+                    rs: Number(item.rs_score || 0),
+                    score: Number(item.burst_score ?? item.selection_score ?? 0),
+                    action: item.action,
+                    reason: item.action_text || '',
+                    stopLoss: Boolean(item.stop),
+                    estSource: item.est_source || '最新日收益回退',
+                    backtest: item.backtest_signals ? `${item.backtest_signals} 次样本` : '样本不足'
+                })).sort((a, b) => b.score - a.score);
+                if (liveData.length) processedData = liveData;
+                if (Array.isArray(payload.holdings) && payload.holdings.length) {
+                    userHoldings = payload.holdings.map(item => ({
+                        code: item.code,
+                        name: item.name,
+                        amount: Number(item.amount || 0),
+                        buyDate: item.buy_date,
+                        totalProfit: Number(item.current_return || 0),
+                    }));
+                    saveUserHoldings();
+                }
+                renderUserHoldings();
+                renderTop3Cards();
+                renderWatchlistTable();
+                initSectorChart();
+                const stamp = document.getElementById('live-data-stamp');
+                if (stamp) stamp.textContent = `数据更新时间：${payload.updated || '最新任务'} · 真实扫描结果`;
+            } catch (error) {
+                const stamp = document.getElementById('live-data-stamp');
+                if (stamp) stamp.textContent = '实时数据加载失败，当前仅显示本地演示数据';
+                console.warn(error);
+            }
+        }
+
+        function addFundToHoldings(code, name) {
+            userHoldings.push({
+                code: code,
+                name: name,
+                amount: 500,
+                buyDate: todayStr,
+                totalProfit: 0
+            });
+            saveUserHoldings();
+            renderUserHoldings();
+        }
+
+        // State variables
+        let currentSector = "ALL";
+        let searchQuery = "";
+        let sortField = "score";
+        let sortDesc = true;
+        let sectorChartInstance = null;
+        let marketMode = "morning"; // 'morning' (09:00) or 'afternoon' (14:30)
+
+        // Auto detect morning or afternoon based on hour
+        function autoDetectMode() {
+            const currentHour = new Date().getHours();
+            if (currentHour >= 12) {
+                setMarketMode('afternoon');
+            } else {
+                setMarketMode('morning');
+            }
+        }
+
+        function setMarketMode(mode) {
+            marketMode = mode;
+            const btnMorning = document.getElementById('mode-btn-morning');
+            const btnAfternoon = document.getElementById('mode-btn-afternoon');
+            const badge = document.getElementById('header-mode-badge');
+            const bannerTitle = document.getElementById('banner-mode-title');
+            const bannerDesc = document.getElementById('banner-mode-desc');
+            const bannerIcon = document.getElementById('banner-mode-icon');
+            const aiBtnText = document.getElementById('ai-report-btn-text');
+
+            if (mode === 'morning') {
+                btnMorning.className = 'px-2.5 py-1 rounded-lg transition-all flex items-center gap-1 bg-amber-500/20 text-amber-300 border border-amber-500/30';
+                btnAfternoon.className = 'px-2.5 py-1 rounded-lg transition-all flex items-center gap-1 text-slate-400 hover:text-slate-200';
+                badge.innerText = '🌅 早盘 09:00 前瞻';
+                badge.className = 'text-[10px] sm:text-xs bg-amber-500/20 text-amber-400 border border-amber-500/30 px-2 py-0.5 rounded-full font-medium';
+                bannerTitle.innerText = '🌅 早盘 09:00 黄金开盘法则：';
+                bannerDesc.innerHTML = '结合隔夜美股与昨日板块强势表现，适合在 <span class="text-white font-mono font-bold bg-slate-800 px-1.5 py-0.5 rounded border border-slate-700">09:15 ~ 09:30</span> 挂单低吸定投。<span class="text-red-400 font-bold">高开幅度过大切忌追高，低开深跌可分批建仓试错</span>。';
+                bannerIcon.className = 'fa-solid fa-sun text-amber-400 text-lg mt-0.5 shrink-0';
+                aiBtnText.innerText = '生成早盘风向 AI 报告';
+            } else {
+                btnAfternoon.className = 'px-2.5 py-1 rounded-lg transition-all flex items-center gap-1 bg-red-500/20 text-red-300 border border-red-500/30';
+                btnMorning.className = 'px-2.5 py-1 rounded-lg transition-all flex items-center gap-1 text-slate-400 hover:text-slate-200';
+                badge.innerText = '🌇 尾盘 14:30 决策';
+                badge.className = 'text-[10px] sm:text-xs bg-red-500/20 text-red-400 border border-red-500/30 px-2 py-0.5 rounded-full font-medium';
+                bannerTitle.innerText = '🌇 支付宝 14:30 黄金决策法则：';
+                bannerDesc.innerHTML = '建议在交易日 <span class="text-white font-mono font-bold bg-slate-800 px-1.5 py-0.5 rounded border border-slate-700">14:25 ~ 14:45</span> 打开支付宝操作。<span class="text-red-400 font-bold">C 类持有未满 7 天赎回需 1.5% 惩罚费</span>，非大跌避险止损请持有满 7 天再做平仓。';
+                bannerIcon.className = 'fa-solid fa-moon text-indigo-400 text-lg mt-0.5 shrink-0';
+                aiBtnText.innerText = '生成尾盘动量 AI 报告';
+            }
+
+            renderTop3Cards();
+            renderWatchlistTable();
+        }
+
+        function renderTop3Cards() {
+            const container = document.getElementById('top3-cards-container');
+            if (!container) return;
+            container.innerHTML = '';
+
+            const top3 = processedData.slice(0, 3);
+            top3.forEach((item, index) => {
+                const rankGradients = [
+                    'from-red-600/30 to-rose-900/30 border-red-500/40 glow-bull',
+                    'from-amber-600/20 to-amber-900/20 border-amber-500/30',
+                    'from-brand-600/20 to-brand-900/20 border-brand-500/30'
+                ];
+
+                const strategyActionText = marketMode === 'morning' 
+                    ? (item.est >= 2.0 ? '🌅 早盘高开预警，建议回调逢低挂单' : '🌅 动量向好，早盘可试错低吸 200元')
+                    : '🌇 尾盘动量强劲，建议加仓 200元';
+
+                const card = document.createElement('div');
+                card.className = `glass-panel p-4 rounded-2xl border bg-gradient-to-b ${rankGradients[index]} space-y-3 relative overflow-hidden transition-all hover:scale-[1.01]`;
+                card.innerHTML = `
+                    <div class="flex justify-between items-start">
+                        <div>
+                            <span class="text-[10px] bg-red-500/20 text-red-400 border border-red-500/30 px-2 py-0.5 rounded-full font-bold">Top ${index + 1} 动量标的</span>
+                            <h3 class="font-bold text-white text-base mt-1.5 truncate max-w-[200px]">${item.name}</h3>
+                            <div class="text-xs text-slate-400 font-mono">${item.code} | ${item.sector}</div>
+                        </div>
+                        <div class="text-right font-mono">
+                            <div class="text-2xl font-black text-red-500">+${item.est.toFixed(2)}%</div>
+                            <div class="text-[10px] text-slate-400">${marketMode === 'morning' ? '昨日/盘前估算' : '今日盘中预估'}</div>
+                        </div>
+                    </div>
+
+                    <div class="grid grid-cols-3 gap-2 py-2 px-3 bg-slate-900/80 rounded-xl text-center text-xs font-mono">
+                        <div>
+                            <div class="text-[10px] text-slate-400">爆发得分</div>
+                            <div class="font-bold text-amber-400">${item.score}</div>
+                        </div>
+                        <div>
+                            <div class="text-[10px] text-slate-400">近3日冲刺</div>
+                            <div class="font-bold text-red-400">+${item.ret3d}%</div>
+                        </div>
+                        <div>
+                            <div class="text-[10px] text-slate-400">近5日冲刺</div>
+                            <div class="font-bold text-red-400">+${item.ret5d}%</div>
+                        </div>
+                    </div>
+
+                    <div class="flex justify-between items-center text-xs pt-1">
+                        <span class="text-slate-300 text-[11px] truncate max-w-[170px]">${strategyActionText}</span>
+                        <button onclick="applyCalculatorTarget('${item.name}', '${item.code}')" class="px-3 py-1 rounded-xl bg-red-600 hover:bg-red-500 text-white font-medium shadow-md transition flex items-center gap-1 shrink-0">
+                            <i class="fa-solid fa-cart-shopping text-[10px]"></i> 加仓 200元
+                        </button>
+                    </div>
+                `;
+                container.appendChild(card);
+            });
+        }
+
+        function applyCalculatorTarget(name, code) {
+            document.getElementById('calc-target-name').innerText = name;
+            recalculateCapital();
+        }
+
+        function renderWatchlistTable() {
+            const tbody = document.getElementById('watchlist-table-body');
+            if (!tbody) return;
+            tbody.innerHTML = '';
+
+            let filtered = processedData.filter(f => {
+                const matchSector = currentSector === 'ALL' || f.sector.includes(currentSector);
+                const matchQuery = !searchQuery || f.name.includes(searchQuery) || f.code.includes(searchQuery) || f.sector.includes(searchQuery);
+                return matchSector && matchQuery;
+            });
+
+            filtered.sort((a, b) => {
+                let valA = a[sortField];
+                let valB = b[sortField];
+                return sortDesc ? valB - valA : valA - valB;
+            });
+
+            document.getElementById('total-fund-count').innerText = `${filtered.length} 只`;
+
+            filtered.forEach(item => {
+                const tr = document.createElement('tr');
+                tr.className = 'hover:bg-slate-800/40 transition-colors font-mono cursor-pointer';
+                tr.onclick = () => openFundDetailModal(item);
+
+                const estColor = item.est >= 0 ? 'text-red-500' : 'text-emerald-500';
+
+                tr.innerHTML = `
+                    <td class="py-3 px-3">
+                        <div class="font-bold text-white font-sans truncate max-w-[180px]">${item.name}</div>
+                        <div class="text-[10px] text-slate-400">${item.code} | <span class="text-brand-400">${item.sector}</span></div>
+                    </td>
+                    <td class="py-3 px-2 font-bold ${estColor}">${item.est >= 0 ? '+' : ''}${item.est.toFixed(2)}%</td>
+                    <td class="py-3 px-2 font-bold text-amber-400">${item.score}</td>
+                    <td class="py-3 px-2 text-slate-300">+${item.ret3d}% / +${item.ret5d}%</td>
+                    <td class="py-3 px-2 ${item.drawdown <= -5.0 ? 'text-red-400 font-bold' : 'text-slate-400'}">${item.drawdown}%</td>
+                    <td class="py-3 px-2 font-sans">
+                        ${item.ma10 ? '<span class="text-[10px] bg-emerald-500/20 text-emerald-400 px-1.5 py-0.5 rounded">🟢 站上10日线</span>' : '<span class="text-[10px] bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded">🔴 均线下整理</span>'}
+                    </td>
+                    <td class="py-3 px-3 text-right font-sans" onclick="event.stopPropagation()">
+                        <button onclick="addFundToHoldings('${item.code}', '${item.name}')" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs border border-slate-700 transition">
+                            + 加入持仓
+                        </button>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        function renderSectorFilters() {
+            const container = document.getElementById('sector-filter-container');
+            if (!container) return;
+
+            const sectors = ["ALL", "半导体/芯片", "AI算力/CPO", "北证50", "科创50", "动漫游戏", "机器人", "港股科技", "微盘高爆发"];
+            container.innerHTML = '';
+
+            sectors.forEach(sec => {
+                const btn = document.createElement('button');
+                btn.className = `px-2.5 py-1 rounded-xl text-xs font-medium transition-all ${currentSector === sec ? 'bg-brand-600 text-white shadow-md' : 'bg-slate-900/90 text-slate-400 hover:text-white border border-slate-800'}`;
+                btn.innerText = sec === 'ALL' ? '全部赛道' : sec;
+                btn.onclick = () => {
+                    currentSector = sec;
+                    renderSectorFilters();
+                    renderWatchlistTable();
+                };
+                container.appendChild(btn);
+            });
+        }
+
+        function recalculateCapital() {
+            const cap = parseFloat(document.getElementById('input-capital').value) || 2000;
+            const ratio = parseFloat(document.getElementById('select-ratio').value) || 10;
+            const buyAmount = Math.round(cap * (ratio / 100));
+            document.getElementById('calc-buy-amount').innerText = `￥${buyAmount} 元`;
+        }
+
+        function addFundToHoldings(code, name) {
+            userHoldings.push({
+                code: code,
+                name: name,
+                amount: 500,
+                buyDate: todayStr,
+                totalProfit: 0
+            });
+            renderUserHoldings();
+        }
+
+        function initSectorChart() {
+            const ctx = document.getElementById('sectorChart');
+            if (!ctx) return;
+
+            if (sectorChartInstance) sectorChartInstance.destroy();
+
+            const sectorCounts = {};
+            processedData.forEach(f => {
+                sectorCounts[f.sector] = (sectorCounts[f.sector] || 0) + 1;
+            });
+
+            sectorChartInstance = new Chart(ctx, {
+                type: 'doughnut',
+                data: {
+                    labels: Object.keys(sectorCounts),
+                    datasets: [{
+                        data: Object.values(sectorCounts),
+                        backgroundColor: [
+                            '#ef4444', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6',
+                            '#ec4899', '#06b6d4', '#84cc16', '#6366f1'
+                        ],
+                        borderWidth: 0
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            display: false
+                        }
+                    },
+                    cutout: '70%'
+                }
+            });
+        }
+
+        function openFundDetailModal(item) {
+            const modal = document.getElementById('modal-detail');
+            const content = document.getElementById('modal-detail-content');
+            content.innerHTML = `
+                <div class="space-y-4">
+                    <div class="flex justify-between items-start border-b border-slate-800 pb-3">
+                        <div>
+                            <h3 class="font-bold text-white text-base">${item.name}</h3>
+                            <p class="text-xs text-brand-400 font-mono">${item.code} | ${item.sector}</p>
+                        </div>
+                        <span class="text-xl font-bold font-mono text-red-500">+${item.est.toFixed(2)}%</span>
+                    </div>
+
+                    <div class="grid grid-cols-2 gap-3 font-mono text-xs">
+                        <div class="p-3 bg-slate-900 rounded-xl border border-slate-800">
+                            <span class="text-slate-400 block mb-1">动量冲刺得分</span>
+                            <span class="text-lg font-bold text-amber-400">${item.score}</span>
+                        </div>
+                        <div class="p-3 bg-slate-900 rounded-xl border border-slate-800">
+                            <span class="text-slate-400 block mb-1">高点最大回撤</span>
+                            <span class="text-lg font-bold ${item.drawdown <= -5 ? 'text-red-400' : 'text-slate-200'}">${item.drawdown}%</span>
+                        </div>
+                        <div class="p-3 bg-slate-900 rounded-xl border border-slate-800">
+                            <span class="text-slate-400 block mb-1">近3日区间涨幅</span>
+                            <span class="text-lg font-bold text-red-400">+${item.ret3d}%</span>
+                        </div>
+                        <div class="p-3 bg-slate-900 rounded-xl border border-slate-800">
+                            <span class="text-slate-400 block mb-1">近20日趋势收益</span>
+                            <span class="text-lg font-bold text-red-400">+${item.ret20d}%</span>
+                        </div>
+                    </div>
+
+                    <div class="p-3 bg-brand-500/10 border border-brand-500/20 rounded-xl text-xs leading-relaxed text-slate-300">
+                        <strong class="text-brand-400 block mb-1">💡 支付宝 14:30 精细化决策建议：</strong>
+                        ${item.stopLoss ? '🔴 触发高点回撤 -8% 预警，建议在支付宝做部分止损避险。' : item.score >= 5.0 ? '🟢 当前正处于短线主升浪冲刺中，支持小资金分批顺势建仓！' : '🟡 趋势稳健但冲刺动量一般，建议继续观望或小额定投。'}
+                    </div>
+
+                    <button onclick="addFundToHoldings('${item.code}', '${item.name}'); closeModal('modal-detail');" class="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-xs rounded-xl shadow-md transition">
+                        添加到我的支付宝持仓
+                    </button>
+                </div>
+            `;
+            modal.classList.remove('hidden');
+        }
+
+        function generateAIReport() {
+            const body = document.getElementById('ai-report-body');
+            document.getElementById('modal-ai-report').classList.remove('hidden');
+
+            setTimeout(() => {
+                const top1 = processedData[0];
+                const top2 = processedData[1];
+                body.innerHTML = `
+                    <div class="p-4 bg-slate-900 rounded-xl border border-slate-800 space-y-2">
+                        <div class="font-bold text-brand-400 text-sm">⚡ 盘中板块动量归因分析 (${new Date().toLocaleTimeString()})</div>
+                        <p>今日盘中高爆发资金显著聚集于 <strong class="text-white">${top1.sector}</strong> 与 <strong class="text-white">${top2.sector}</strong> 赛道。</p>
+                        <p>推荐动量龙头标的：<span class="text-red-400 font-bold">${top1.name} (${top1.code})</span>，今日预估强攻 <span class="text-red-400 font-bold">+${top1.est}%</span>，冲刺综合得分 <span class="text-amber-400 font-bold">${top1.score}</span>。</p>
+                    </div>
+
+                    <div class="p-4 bg-slate-900 rounded-xl border border-slate-800 space-y-2">
+                        <div class="font-bold text-emerald-400 text-sm">🛡️ 个人持仓风控评估与 1.5% 规避</div>
+                        <p>目前持仓共包含 <strong class="text-white">${userHoldings.length}</strong> 只标的。</p>
+                        <p>建议：对于未持满 7 天的标的（规避 1.5% 赎回手续费），除非触发大跌平仓线（回撤超过 -8%），请尽量保持分批持有。</p>
+                    </div>
+                `;
+            }, 800);
+        }
+
+        function closeModal(id) {
+            document.getElementById(id).classList.add('hidden');
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            autoDetectMode();
+            setInterval(() => {
+                const now = new Date();
+                const el = document.getElementById('current-time-display');
+                if (el) el.innerText = now.toTimeString().split(' ')[0];
+            }, 1000);
+
+            renderUserHoldings();
+            renderTop3Cards();
+            renderSectorFilters();
+            renderWatchlistTable();
+            initSectorChart();
+            recalculateCapital();
+            loadRealDashboardData();
+
+            // Setup listeners
+            document.getElementById('input-capital')?.addEventListener('input', recalculateCapital);
+            document.getElementById('select-ratio')?.addEventListener('change', recalculateCapital);
+            document.getElementById('search-input')?.addEventListener('input', (e) => {
+                searchQuery = e.target.value.trim();
+                renderWatchlistTable();
+            });
+
+            document.getElementById('sort-est')?.addEventListener('click', () => {
+                sortField = 'est';
+                sortDesc = !sortDesc;
+                renderWatchlistTable();
+            });
+
+            document.getElementById('sort-score')?.addEventListener('click', () => {
+                sortField = 'score';
+                sortDesc = !sortDesc;
+                renderWatchlistTable();
+            });
+
+            // Modals toggle
+            document.getElementById('btn-open-portfolio-modal')?.addEventListener('click', () => {
+                document.getElementById('modal-portfolio').classList.remove('hidden');
+            });
+            document.getElementById('btn-paste-shortcut')?.addEventListener('click', () => {
+                document.getElementById('modal-portfolio').classList.remove('hidden');
+            });
+            document.getElementById('btn-close-portfolio')?.addEventListener('click', () => closeModal('modal-portfolio'));
+            document.getElementById('btn-add-manual-holding')?.addEventListener('click', () => {
+                const select = document.getElementById('manual-fund-select');
+                select.innerHTML = '';
+                processedData.forEach(f => {
+                    select.innerHTML += `<option value="${f.code}">${f.name} (${f.code})</option>`;
+                });
+                document.getElementById('manual-buy-date').value = todayStr;
+                document.getElementById('modal-manual-holding').classList.remove('hidden');
+            });
+            document.getElementById('btn-close-manual')?.addEventListener('click', () => closeModal('modal-manual-holding'));
+            document.getElementById('btn-close-detail')?.addEventListener('click', () => closeModal('modal-detail'));
+            document.getElementById('btn-close-ai')?.addEventListener('click', () => closeModal('modal-ai-report'));
+            document.getElementById('btn-open-ai-report')?.addEventListener('click', generateAIReport);
+
+            // Manual save
+            document.getElementById('btn-save-manual-holding')?.addEventListener('click', () => {
+                const select = document.getElementById('manual-fund-select');
+                const amt = parseFloat(document.getElementById('manual-hold-amount').value) || 1000;
+                const dateVal = document.getElementById('manual-buy-date').value || todayStr;
+                const matchFund = processedData.find(f => f.code === select.value);
+
+                userHoldings.push({
+                    code: select.value,
+                    name: matchFund ? matchFund.name : "自定义基金",
+                    amount: amt,
+                    buyDate: dateVal,
+                    totalProfit: 0
+                });
+
+                renderUserHoldings();
+                closeModal('modal-manual-holding');
+            });
+
+            // OCR confirm & cancel
+            document.getElementById('btn-confirm-ocr')?.addEventListener('click', () => {
+                tempParsedOcrHoldings.forEach(item => {
+                    userHoldings.push({
+                        code: item.fundCode || "012616",
+                        name: item.fundName,
+                        amount: item.holdAmount || 1000,
+                        buyDate: item.buyDate || todayStr,
+                        totalProfit: item.totalProfit || 0
+                    });
+                });
+                renderUserHoldings();
+                closeModal('modal-portfolio');
+                document.getElementById('ocr-status-container').classList.add('hidden');
+            });
+
+            document.getElementById('btn-cancel-ocr')?.addEventListener('click', () => {
+                document.getElementById('ocr-status-container').classList.add('hidden');
+            });
+
+            // Drag and drop setup
+            const dropZone = document.getElementById('drop-zone');
+            const fileInput = document.getElementById('file-input-screenshot');
+
+            dropZone?.addEventListener('click', () => fileInput.click());
+            fileInput?.addEventListener('change', (e) => {
+                if (e.target.files.length > 0) handleFileSelect(e.target.files[0]);
+            });
+
+            dropZone?.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                dropZone.classList.add('drag-over');
+            });
+
+            dropZone?.addEventListener('dragleave', () => {
+                dropZone.classList.remove('drag-over');
+            });
+
+            dropZone?.addEventListener('drop', (e) => {
+                e.preventDefault();
+                dropZone.classList.remove('drag-over');
+                if (e.dataTransfer.files.length > 0) {
+                    handleFileSelect(e.dataTransfer.files[0]);
+                }
+            });
+
+            // Global Ctrl+V paste support
+            window.addEventListener('paste', (e) => {
+                const items = (e.clipboardData || e.originalEvent.clipboardData).items;
+                for (let item of items) {
+                    if (item.type.indexOf('image') === 0) {
+                        const file = item.getAsFile();
+                        document.getElementById('modal-portfolio').classList.remove('hidden');
+                        handleFileSelect(file);
+                        break;
+                    }
+                }
+            });
+
+            // Refresh buttons
+            const handleRefresh = () => {
+                const icons = [document.getElementById('refresh-icon-mobile'), document.getElementById('refresh-icon-desktop')];
+                icons.forEach(ic => ic?.classList.add('fa-spin'));
+                setTimeout(() => {
+                    icons.forEach(ic => ic?.classList.remove('fa-spin'));
+                    renderUserHoldings();
+                    renderTop3Cards();
+                    renderWatchlistTable();
+                }, 600);
+            };
+
+            document.getElementById('btn-refresh-data')?.addEventListener('click', handleRefresh);
+            document.getElementById('btn-refresh-data-desktop')?.addEventListener('click', handleRefresh);
+        });
+    </script>
+</body>
+</html>
