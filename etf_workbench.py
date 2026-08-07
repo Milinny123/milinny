@@ -1738,7 +1738,21 @@ const sectorMap=new Map(); data.results.forEach(item=>{{const bucket=sectorMap.g
 
 
 def write_dashboard(context: dict[str, Any], title: str, path: str | Path = "index.html") -> None:
-    Path(path).write_text(build_dashboard(context, title), encoding="utf-8")
+    generated_data_page = build_dashboard(context, title)
+    mobile_template_path = Path("artifact.html")
+    if mobile_template_path.exists():
+        match = re.search(
+            r'<script type="application/json" id="dashboard-data">([\s\S]*?)</script>',
+            generated_data_page,
+        )
+        if match:
+            mobile_page = mobile_template_path.read_text(encoding="utf-8")
+            placeholder = '<script type="application/json" id="dashboard-data"></script>'
+            embedded = f'<script type="application/json" id="dashboard-data">{match.group(1)}</script>'
+            mobile_page = mobile_page.replace(placeholder, embedded, 1)
+            Path(path).write_text(mobile_page, encoding="utf-8")
+            return
+    Path(path).write_text(generated_data_page, encoding="utf-8")
 
 
 def push_wechat(title: str, markdown: str) -> None:
