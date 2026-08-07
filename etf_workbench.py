@@ -92,6 +92,7 @@ T0_ETF_ALLOWLIST: dict[str, dict[str, str]] = {
 }
 
 _ETF_SPOT_CACHE: pd.DataFrame | None = None
+_ETF_SPOT_INDEX: dict[str, dict[str, Any]] | None = None
 _FUND_ESTIMATION_CACHE: dict[str, dict[str, Any]] | None = None
 
 # Codes are checked against AKShare's fund catalog at runtime.  The catalog is
@@ -324,6 +325,44 @@ def _etf_spot() -> pd.DataFrame:
             raise ValueError("全市场 ETF 实时行情为空")
         _ETF_SPOT_CACHE = frame
     return _ETF_SPOT_CACHE.copy()
+
+
+def etf_realtime_snapshot(failures: list[str]) -> dict[str, dict[str, Any]]:
+    """Normalize the current ETF quote table once for analysis and reporting."""
+    global _ETF_SPOT_INDEX
+    if _ETF_SPOT_INDEX is not None:
+        return _ETF_SPOT_INDEX
+    try:
+        frame = _etf_spot()
+        code_col = _spot_column(frame, ("代码", "基金代码", "code"))
+        name_col = _spot_column(frame, ("名称", "基金简称", "name"))
+        price_col = _spot_column(frame, ("最新价", "现价", "价格", "price"))
+        change_col = _spot_column(frame, ("涨跌幅", "日涨跌幅", "change"))
+        amount_col = _spot_column(frame, ("成交额", "成交金额", "amount"))
+        if not code_col or not price_col:
+            raise ValueError(f"ETF 实时行情字段不完整: {list(frame.columns)}")
+        quotes: dict[str, dict[str, Any]] = {}
+        for _, row in frame.iterrows():
+            match = re.search(r"\d{6}", str(row[code_col]))
+            price = _percent_number(row[price_col])
+            if not match or price is None or price <= 0:
+                continue
+            change = _percent_number(row[change_col]) if change_col else None
+            quotes[match.group(0)] = {
+                "quote_price": price,
+                "quote_change": change,
+                "quote_name": str(row[name_col]).strip() if name_col else "",
+                "quote_turnover": _percent_number(row[amount_col]) if amount_col else None,
+                "quote_source": "AKShare fund_etf_spot_em 实时行情",
+            }
+        if not quotes:
+            raise ValueError("ETF 实时行情未解析出有效记录")
+        _ETF_SPOT_INDEX = quotes
+        return quotes
+    except Exception as exc:
+        failures.append(f"ETF 实时行情：{_short_error(exc)}；场内标的使用历史行情回退")
+        _ETF_SPOT_INDEX = {}
+        return {}
 
 
 def _percent_number(value: Any) -> float | None:
@@ -701,11 +740,18 @@ def analyse_item(
     benchmark_returns: dict[int, float],
     as_of: datetime,
     intraday_estimations: dict[str, dict[str, Any]] | None = None,
+    realtime_quotes: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     history, data_code, source = fetch_item_history(item)
     if len(history) < 61:
         raise ValueError(f"有效数据 {len(history)} 条，少于 61 条")
-    close = history["close"]
+    quote = (realtime_quotes or {}).get(item["code"], {}) if item["kind"] == "etf" else {}
+    close = history["close"].copy()
+    quote_price = quote.get("quote_price")
+    if quote_price is not None:
+        # Keep historical dates for trend/backtest, but replace only today's
+        # terminal value so 1/3/5/20-day returns reflect the live ETF quote.
+        close.iloc[-1] = float(quote_price)
     returns = {days: _return(close, days) for days in (1, 3, 5, 20, 60)}
     daily_returns = close.pct_change().dropna().tail(20) * 100
     max_daily_gain20 = float(daily_returns.max())
@@ -718,6 +764,7 @@ def analyse_item(
     drawdown = (latest / high20 - 1) * 100
     data_date = history["date"].iloc[-1].date()
     data_age_days = (as_of.astimezone(BEIJING_TZ).date() - data_date).days
+    effective_age_days = 0 if quote_price is not None else data_age_days
     score = (
         returns[5] * MOMENTUM_WEIGHTS[0]
         + returns[20] * MOMENTUM_WEIGHTS[1]
@@ -725,7 +772,16 @@ def analyse_item(
     )
     estimation = (intraday_estimations or {}).get(item["code"], {})
     est_growth = estimation.get("est_growth")
-    intraday_growth = returns[1] if est_growth is None else float(est_growth)
+    quote_change = quote.get("quote_change")
+    if quote_change is not None:
+        intraday_growth = float(quote_change)
+        intraday_source = quote.get("quote_source", "AKShare ETF 实时行情")
+    elif est_growth is not None:
+        intraday_growth = float(est_growth)
+        intraday_source = "东方财富盘中净值估算"
+    else:
+        intraday_growth = returns[1]
+        intraday_source = "最新日收益回退"
     burst_score = (
         intraday_growth * BURST_WEIGHTS[0]
         + returns[3] * BURST_WEIGHTS[1]
@@ -739,13 +795,33 @@ def analyse_item(
     )
     rs20 = returns[20] - benchmark_returns.get(20, 0.0)
     rs60 = returns[60] - benchmark_returns.get(60, 0.0)
+    backtest = _rolling_entry_backtest(close)
+    trend_agreement = sum((latest >= ma20, latest >= ma60, rs20 > 0, rs60 > 0)) / 4
+    if backtest["backtest_signals"] >= MIN_BACKTEST_SIGNALS:
+        win_quality = min(1.0, max(0.0, (backtest["backtest_win3"] - 50) / 20))
+        avg_quality = min(1.0, max(0.0, backtest["backtest_avg3"] / 1.0))
+        backtest_quality = win_quality * 0.6 + avg_quality * 0.4
+    else:
+        backtest_quality = 0.0
+    freshness_quality = 1.0 if quote_price is not None or est_growth is not None else max(0.0, 1 - data_age_days / 10)
+    prediction_quality = round(100 * (trend_agreement * 0.35 + backtest_quality * 0.4 + freshness_quality * 0.25), 1)
+    data_freshness = (
+        "实时 ETF 行情" if quote_price is not None
+        else ("盘中净值估算" if est_growth is not None else "历史净值/行情")
+    )
     return {
         **item,
         "data_code": data_code,
         "source": source,
         "data_date": data_date.isoformat(),
-        "data_age_days": data_age_days,
-        "stale": data_age_days > MAX_DATA_AGE_DAYS,
+        "data_age_days": effective_age_days,
+        "stale": effective_age_days > MAX_DATA_AGE_DAYS,
+        "data_freshness": data_freshness,
+        "prediction_quality": prediction_quality,
+        "quality_label": "高" if prediction_quality >= 70 else ("中" if prediction_quality >= 50 else "低"),
+        "quote_price": quote_price,
+        "quote_turnover": quote.get("quote_turnover"),
+        "quote_date": as_of.astimezone(BEIJING_TZ).date().isoformat() if quote_price is not None else None,
         "latest": latest,
         "r1": returns[1],
         "r3": returns[3],
@@ -755,7 +831,7 @@ def analyse_item(
         "score": score,
         "est_growth": est_growth,
         "est_value": estimation.get("est_value"),
-        "est_source": "东方财富盘中净值估算" if est_growth is not None else "最新日收益回退",
+        "est_source": intraday_source,
         "intraday_growth": intraday_growth,
         "burst_score": burst_score,
         "short_score": short_score,
@@ -775,7 +851,7 @@ def analyse_item(
         "target_move_days20": target_move_days20,
         "high_move_capable": max_daily_gain20 >= TARGET_DAILY_MOVE,
         "benchmark_verified": bool(benchmark_returns),
-        **_rolling_entry_backtest(close),
+        **backtest,
     }
 
 
@@ -1068,9 +1144,12 @@ def enrich_news_and_scenarios(results: list[dict[str, Any]], failures: list[str]
         item["next_day_center"] = center
         item["next_day_low"] = max(-10.0, center - radius)
         item["next_day_high"] = min(10.0, center + radius)
-        item["forecast_confidence"] = (
-            "中" if news["titles"] and item["above_ma20"] and not item["stale"] else "低"
-        )
+        if item.get("prediction_quality", 0) >= 70 and item.get("data_freshness") in {"实时 ETF 行情", "盘中净值估算"} and item["above_ma20"]:
+            item["forecast_confidence"] = "中高"
+        elif item.get("prediction_quality", 0) >= 50 and item["above_ma20"] and not item["stale"]:
+            item["forecast_confidence"] = "中"
+        else:
+            item["forecast_confidence"] = "低"
 
 
 def _redemption_fee_summary(frame: pd.DataFrame) -> tuple[str, int | None]:
@@ -1207,6 +1286,7 @@ def analyse_market(now: datetime | None = None) -> dict[str, Any]:
         failures.append(f"持仓文件：{_short_error(exc)}")
     watchlist, dynamic_count = build_watchlist(failures, holdings)
     intraday_estimations = fund_intraday_estimations(failures)
+    realtime_quotes = etf_realtime_snapshot(failures)
     benchmark_returns: dict[int, float] = {}
     benchmark_date = ""
     try:
@@ -1224,7 +1304,7 @@ def analyse_market(now: datetime | None = None) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     for item in watchlist:
         try:
-            results.append(analyse_item(item, benchmark_returns, now, intraday_estimations))
+            results.append(analyse_item(item, benchmark_returns, now, intraday_estimations, realtime_quotes))
         except Exception as exc:
             failures.append(f"{item['code']} {item['name']}：{_short_error(exc)}")
     _rank_results(results)
@@ -1247,6 +1327,7 @@ def analyse_market(now: datetime | None = None) -> dict[str, Any]:
         "benchmark_returns": benchmark_returns,
         "benchmark_date": benchmark_date,
         "intraday_estimation_count": len(intraday_estimations),
+        "realtime_quote_count": len(realtime_quotes),
         "intraday_t0": intraday_t0,
         "holdings": enriched_holdings,
         "invested_amount": invested_amount,
@@ -1456,7 +1537,7 @@ def build_report(context: dict[str, Any]) -> tuple[str, str]:
         "",
         f"**7日纪律：** 计划最长持有 {MAX_PLANNED_HOLD_DAYS} 天；场外基金只有免赎回费期限不超过该计划时才允许出现买入信号，到期必须复核。",
         f"**风险提示：** 当前为{'进攻' if RISK_PROFILE == 'aggressive' else '均衡'}档，爆发得分按盘中估算/3日/5日/20日 45%/30%/15%/10% 计算，可能带来更大回撤；不代表收益预测。",
-        f"**估值说明：** 本次盘中估值覆盖 {context.get('intraday_estimation_count', 0)} 只基金；没有估值的标的使用最新日收益回退并明确标注。",
+        f"**数据说明：** AKShare 实时 ETF 行情覆盖 {context.get('realtime_quote_count', 0)} 只；东方财富盘中净值估算覆盖 {context.get('intraday_estimation_count', 0)} 只基金；其余标的使用最新日收益回退并明确标注。",
         f"**入场规则：** 盘中估算涨幅高于 {ENTRY_MAX_DAILY_MOVE:.1f}% 视为过热并等待回踩，不再把单日大涨当作买点。",
         "**回测说明：** 胜率和平均收益来自近150条净值/行情的滚动历史样本，不含未来数据，但仍可能过拟合且不代表未来。",
         "**免责声明：** 本报告由量化脚本自动生成，仅供研究参考，不构成投资建议。",
@@ -1478,7 +1559,7 @@ def _dashboard_row(item: dict[str, Any]) -> str:
         f"<tr data-kind='{html.escape(item['kind'])}' data-sector='{html.escape(item['sector'])}'><td>{item['rank']}</td>"
         f"<td><strong>{html.escape(item['name'])}</strong><small>{html.escape(item['code'])} · {kind_label} · {html.escape(item['sector'])}</small></td>"
         f"<td>{html.escape(item['data_date'])}</td>"
-        f"<td>{item['intraday_growth']:.2f}%<small>{html.escape(item['est_source'])}</small></td>"
+        f"<td>{item['intraday_growth']:.2f}%<small>{html.escape(item['est_source'])} · 质量 {item.get('prediction_quality', 0):.0f}/100</small></td>"
         f"<td>{item['r1']:.2f}%</td><td>{item['max_daily_gain20']:.2f}%<small>达标 {item['target_move_days20']} 次</small></td>"
         f"<td>{item['burst_score']:.2f}</td><td>{item['pool_percentile']:.1f}%</td>"
         f"<td>{item['r20']:.2f}%<br><small>RS {item['rs20']:.2f}%</small></td>"
@@ -1559,7 +1640,7 @@ def _dashboard_decision_card(item: dict[str, Any]) -> str:
         f"<span>建议金额<strong>{item.get('amount', 0):.0f} 元</strong></span>"
         f"<span>计划持有<strong>{html.escape(holding)}</strong></span>"
         f"<span>次日情景<strong>{item.get('next_day_low', 0):.2f}% ～ {item.get('next_day_high', 0):.2f}%</strong></span></div>"
-        f"<p>{html.escape(action)}</p><small>{html.escape(manager)}；{html.escape(_backtest_text(item))}；情景估计为{item.get('forecast_confidence', '低')}置信度，不是收益保证。</small>"
+        f"<p>{html.escape(action)}</p><small>{html.escape(manager)}；{html.escape(_backtest_text(item))}；数据{html.escape(item.get('data_freshness', '待核验'))}；质量 {item.get('prediction_quality', 0):.0f}/100；情景估计为{item.get('forecast_confidence', '低')}置信度，不是收益保证。</small>"
         "</article>"
     )
 
@@ -1575,6 +1656,8 @@ def build_dashboard(context: dict[str, Any], title: str) -> str:
         "watch_count": context["watch_count"],
         "results": results,
         "intraday_t0": context.get("intraday_t0", []),
+        "realtime_quote_count": context.get("realtime_quote_count", 0),
+        "intraday_estimation_count": context.get("intraday_estimation_count", 0),
         "holdings": context.get("holdings", []),
         "invested_amount": context.get("invested_amount", 0),
         "remaining_cash": context.get("remaining_cash", TOTAL_CAPITAL),
@@ -1626,7 +1709,7 @@ main {{ position:relative; max-width:1320px; margin:0 auto; padding:28px 20px 56
 .positive {{ color:var(--green); font-weight:700; }} .danger {{ color:var(--red); font-weight:700; }} .neutral {{ color:var(--amber); }} .notes {{ padding:16px; margin-top:16px; }} .notes h2 {{ font-size:16px; margin:0 0 8px; }} .notes ul {{ margin:8px 0 0; padding-left:20px; color:var(--muted); }}
 @media (max-width:800px) {{ main {{ padding:12px 9px 36px; }} header {{ display:block; padding:16px; }} .stamp {{ text-align:left; margin-top:10px; }} .stats {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .decision-grid,.visual-grid {{ grid-template-columns:1fr; }} .query-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .toolbar,.lookup-bar,.calculator-grid {{ flex-direction:column; }} .chart-panel {{ min-height:270px; }} }}
 </style></head><body><main>
-<header><div><div class="eyebrow">HIGH BURST FUND WORKBENCH · {TOTAL_CAPITAL} CNY</div><h1>{html.escape(title)}</h1><p>盘中净值估算、3/5/20日爆发动量、历史回测与持仓风控。</p></div><div class="stamp">更新时间<br><strong>{now:%Y-%m-%d %H:%M} 北京时间</strong><br>估值覆盖 {context.get('intraday_estimation_count', 0)} 只</div></header>
+<header><div><div class="eyebrow">HIGH BURST FUND WORKBENCH · {TOTAL_CAPITAL} CNY</div><h1>{html.escape(title)}</h1><p>AKShare 实时 ETF 行情、盘中净值估算、3/5/20日动量、滚动回测与持仓风控。</p></div><div class="stamp">更新时间<br><strong>{now:%Y-%m-%d %H:%M} 北京时间</strong><br>ETF 实时 {context.get('realtime_quote_count', 0)} 只 · 基金估值 {context.get('intraday_estimation_count', 0)} 只</div></header>
 <section class="stats"><div class="stat"><span>当前持仓</span><b>{len(holdings)}</b></div><div class="stat"><span>已投入</span><b>{context.get('invested_amount', 0):.0f}</b></div><div class="stat"><span>剩余资金</span><b>{context.get('remaining_cash', TOTAL_CAPITAL):.0f}</b></div><div class="stat"><span>有色/稀土</span><b>{len(metals)}</b></div><div class="stat"><span>有效标的</span><b>{len(results)}</b></div></section>
 <div class="section-title"><div><h2>今日盘中动量冲刺 Top 3</h2><p>按 45% 盘中估算 + 30% 近3日 + 15% 近5日 + 10% 近20日排序；动作仍接受回测与防追高约束。</p></div></div>
 <section class="decision-grid">{decision_cards or '<article class="decision-card"><h3>今天没有通过全部门槛的候选</h3><p>保留现金，不为了目标涨幅强行交易。</p></article>'}</section>
