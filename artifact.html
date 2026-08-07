@@ -612,7 +612,9 @@
                     reason: item.action_text || '',
                     stopLoss: Boolean(item.stop),
                     estSource: item.est_source || '最新日收益回退',
-                    backtest: item.backtest_signals ? `${item.backtest_signals} 次样本` : '样本不足'
+                    backtest: item.backtest_signals ? `${item.backtest_signals} 次样本` : '样本不足',
+                    quality: Number(item.prediction_quality || 0),
+                    freshness: item.data_freshness || '历史净值/行情'
                 })).sort((a, b) => b.score - a.score);
                 if (liveData.length) processedData = liveData;
                 if (Array.isArray(payload.holdings) && payload.holdings.length) {
@@ -633,7 +635,7 @@
                 if (stamp) stamp.textContent = `数据更新时间：${payload.updated || '最新任务'} · 真实扫描结果`;
             } catch (error) {
                 const stamp = document.getElementById('live-data-stamp');
-                if (stamp) stamp.textContent = '实时数据加载失败，当前仅显示本地演示数据';
+                if (stamp) stamp.textContent = '实时数据加载失败，请稍后刷新';
                 console.warn(error);
             }
         }
@@ -731,7 +733,7 @@
                         </div>
                         <div class="text-right font-mono">
                             <div class="text-2xl font-black text-red-500">+${item.est.toFixed(2)}%</div>
-                            <div class="text-[10px] text-slate-400">${marketMode === 'morning' ? '昨日/盘前估算' : '今日盘中预估'}</div>
+                            <div class="text-[10px] text-slate-400">${item.estSource} · 质量 ${item.quality.toFixed(0)}/100</div>
                         </div>
                     </div>
 
@@ -797,7 +799,7 @@
                         <div class="font-bold text-white font-sans truncate max-w-[180px]">${item.name}</div>
                         <div class="text-[10px] text-slate-400">${item.code} | <span class="text-brand-400">${item.sector}</span></div>
                     </td>
-                    <td class="py-3 px-2 font-bold ${estColor}">${item.est >= 0 ? '+' : ''}${item.est.toFixed(2)}%</td>
+                    <td class="py-3 px-2 font-bold ${estColor}">${item.est >= 0 ? '+' : ''}${item.est.toFixed(2)}%<div class="text-[10px] text-slate-500 font-normal">${item.estSource}<br>质量 ${item.quality.toFixed(0)}/100</div></td>
                     <td class="py-3 px-2 font-bold text-amber-400">${item.score}</td>
                     <td class="py-3 px-2 text-slate-300">+${item.ret3d}% / +${item.ret5d}%</td>
                     <td class="py-3 px-2 ${item.drawdown <= -5.0 ? 'text-red-400 font-bold' : 'text-slate-400'}">${item.drawdown}%</td>
@@ -918,6 +920,10 @@
                         <div class="p-3 bg-slate-900 rounded-xl border border-slate-800">
                             <span class="text-slate-400 block mb-1">近20日趋势收益</span>
                             <span class="text-lg font-bold text-red-400">+${item.ret20d}%</span>
+                        </div>
+                        <div class="p-3 bg-slate-900 rounded-xl border border-slate-800">
+                            <span class="text-slate-400 block mb-1">数据来源 / 质量</span>
+                            <span class="text-sm font-bold text-slate-200">${item.estSource}<br>${item.quality.toFixed(0)}/100</span>
                         </div>
                     </div>
 
