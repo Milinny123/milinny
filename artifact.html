@@ -588,7 +588,7 @@
 
         async function loadRealDashboardData() {
             try {
-                const response = await fetch('index.html?data=' + Date.now(), { cache: 'no-store' });
+                const response = await fetch('data.html?data=' + Date.now(), { cache: 'no-store' });
                 if (!response.ok) throw new Error('实时仪表盘数据请求失败');
                 const page = await response.text();
                 // Escape the closing tag inside this inline script so the HTML parser
