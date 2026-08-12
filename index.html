@@ -442,6 +442,22 @@
         // storage is only used for edits made in this browser.
         let userHoldings = JSON.parse(localStorage.getItem('user_holdings_v1') || '[]');
 
+        // A one-time sync link can seed this browser without publishing holdings
+        // in the generated dashboard payload or overwriting later local edits.
+        (function applyOneTimeHoldingSync() {
+            const prefix = '#holdings=';
+            if (!location.hash.startsWith(prefix)) return;
+            try {
+                const incoming = JSON.parse(decodeURIComponent(location.hash.slice(prefix.length)));
+                if (Array.isArray(incoming) && incoming.length && !localStorage.getItem('user_holdings_sync_ba0bb01')) {
+                    userHoldings = incoming;
+                    localStorage.setItem('user_holdings_v1', JSON.stringify(userHoldings));
+                    localStorage.setItem('user_holdings_sync_ba0bb01', '1');
+                    history.replaceState(null, '', location.pathname + location.search);
+                }
+            } catch (error) { console.warn('持仓同步片段无效', error); }
+        }());
+
         let tempParsedOcrHoldings = [];
         let fundCatalog = [];
 
@@ -492,27 +508,18 @@
             const portrait = bitmap.height > bitmap.width * 1.35;
             if (!portrait) return file;
             const sourceX = 0;
-            const sourceY = Math.round(bitmap.height * 0.29);
-            const sourceWidth = Math.round(bitmap.width * 0.62);
-            const sourceHeight = Math.round(bitmap.height * 0.54);
-            const scale = 2.5;
+            const sourceY = Math.round(bitmap.height * 0.315);
+            const sourceWidth = bitmap.width;
+            const sourceHeight = Math.round(bitmap.height * 0.53);
+            const scale = bitmap.width < 900 ? 1.5 : 1;
             const canvas = document.createElement('canvas');
             canvas.width = Math.round(sourceWidth * scale);
             canvas.height = Math.round(sourceHeight * scale);
-            const context = canvas.getContext('2d', { willReadFrequently: true });
+            const context = canvas.getContext('2d');
             context.imageSmoothingEnabled = true;
             context.imageSmoothingQuality = 'high';
             context.drawImage(bitmap, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, canvas.width, canvas.height);
             bitmap.close();
-            const pixels = context.getImageData(0, 0, canvas.width, canvas.height);
-            for (let index = 0; index < pixels.data.length; index += 4) {
-                const gray = pixels.data[index] * 0.299 + pixels.data[index + 1] * 0.587 + pixels.data[index + 2] * 0.114;
-                const enhanced = gray > 210 ? 255 : (gray < 105 ? 0 : Math.round((gray - 105) * 255 / 105));
-                pixels.data[index] = enhanced;
-                pixels.data[index + 1] = enhanced;
-                pixels.data[index + 2] = enhanced;
-            }
-            context.putImageData(pixels, 0, 0);
             return canvas;
         }
 
@@ -523,7 +530,11 @@
             const values = [...cleaned.matchAll(/[¥￥]\s*([\d,]+(?:\.\d{1,2})?)/g)]
                 .map(match => Number(match[1].replace(/,/g, '')))
                 .filter(value => value > 0);
-            return values[0] || null;
+            if (values.length) return values[0];
+            const ocrValues = [...cleaned.matchAll(/(?:^|\s)([\d,]+\.\d{2})(?!\s*%)/g)]
+                .map(match => Number(match[1].replace(/,/g, '')))
+                .filter(value => value > 0);
+            return ocrValues[0] || null;
         }
 
         function parseOcrHoldings(text) {
@@ -544,11 +555,14 @@
             if (exactCodes.length) return [...found.values()];
             lines.forEach((line, index) => {
                 const nearby = lines.slice(Math.max(0, index - 1), index + 3).join(' ');
-                const hasNearbyAmount = /[¥￥]\s*[\d,]+(?:\.\d{1,2})?/.test(nearby);
+                const amountLine = lines[index + 1] || '';
+                const amount = extractAmount(amountLine) || extractAmount(nearby);
+                const hasNearbyAmount = Number.isFinite(amount) && amount > 0;
                 if (!/\d{6}/.test(line) && hasNearbyAmount) {
-                    const fund = resolveCatalogFund(line);
+                    const nameOnly = line.replace(/\s+[+\-−]?\d+(?:[.,]\d+)?\s*%?.*$/, '').trim();
+                    const fund = resolveCatalogFund(nameOnly) || resolveCatalogFund(line);
                     if (fund && !found.has(fund.code)) {
-                        found.set(fund.code, { fundCode: fund.code, fundName: fund.name, holdAmount: extractAmount(nearby, fund.code), buyDate: '', totalProfit: 0, confidence: fund.confidence });
+                        found.set(fund.code, { fundCode: fund.code, fundName: fund.name, holdAmount: amount, buyDate: '', totalProfit: 0, confidence: fund.confidence });
                     }
                 }
             });
@@ -584,7 +598,7 @@
         }
 
         function calculateDaysHeld(buyDateStr) {
-            if (!buyDateStr) return 0;
+            if (!buyDateStr) return null;
             const buy = new Date(buyDateStr);
             const now = new Date();
             const diffTime = Math.max(0, now - buy);
@@ -633,7 +647,8 @@
 
                 const daysHeld = calculateDaysHeld(item.buyDate);
                 const unlockDate = getPenaltyUnlockDate(item.buyDate);
-                const isLocked = daysHeld < 7;
+                const dateUnknown = daysHeld === null;
+                const isLocked = !dateUnknown && daysHeld < 7;
                 if (isLocked) penaltyCount++;
 
                 const tr = document.createElement('tr');
@@ -648,15 +663,15 @@
                         ${todayProfit >= 0 ? '+' : ''}￥${todayProfit.toFixed(2)} (${estGrowth >= 0 ? '+' : ''}${estGrowth.toFixed(2)}%)
                     </td>
                     <td class="py-2.5 px-2">
-                        <input type="date" value="${item.buyDate || todayStr}" onchange="updateHoldingBuyDate(${index}, this.value)" class="bg-slate-900 border border-slate-700 text-xs text-slate-200 px-1.5 py-0.5 rounded font-mono focus:outline-none focus:border-brand-500">
-                        <span class="text-[10px] ${isLocked ? 'text-amber-400' : 'text-emerald-400'} ml-1">已持 ${daysHeld} 天</span>
+                        <input type="date" value="${item.buyDate || ''}" onchange="updateHoldingBuyDate(${index}, this.value)" class="bg-slate-900 border border-slate-700 text-xs text-slate-200 px-1.5 py-0.5 rounded font-mono focus:outline-none focus:border-brand-500">
+                        <span class="text-[10px] ${dateUnknown ? 'text-amber-300' : (isLocked ? 'text-amber-400' : 'text-emerald-400')} ml-1">${dateUnknown ? '日期待确认' : `已持 ${daysHeld} 天`}</span>
                     </td>
                     <td class="py-2.5 px-2">
                         <span class="text-xs ${isLocked ? 'text-amber-400 font-bold' : 'text-slate-400'}">${unlockDate}</span>
-                        ${isLocked ? '<span class="text-[10px] bg-amber-500/20 text-amber-300 border border-amber-500/30 px-1 py-0.5 rounded ml-1">1.5% 锁定中</span>' : '<span class="text-[10px] bg-emerald-500/20 text-emerald-400 px-1 py-0.5 rounded ml-1">已解冻免费</span>'}
+                        ${dateUnknown ? '<span class="text-[10px] bg-amber-500/20 text-amber-300 border border-amber-500/30 px-1 py-0.5 rounded ml-1">待核对</span>' : (isLocked ? '<span class="text-[10px] bg-amber-500/20 text-amber-300 border border-amber-500/30 px-1 py-0.5 rounded ml-1">1.5% 锁定中</span>' : '<span class="text-[10px] bg-emerald-500/20 text-emerald-400 px-1 py-0.5 rounded ml-1">已解冻免费</span>')}
                     </td>
                     <td class="py-2.5 px-2 font-sans">
-                        ${isLocked ? '<span class="text-[10px] text-amber-300">🟡 离7天解冻还差 ' + (7 - daysHeld) + ' 天，非大跌勿平仓</span>' : (estGrowth >= 2.0 ? '<span class="text-[10px] text-red-400 font-bold">🟢 短线动量极强，可锁定收益或分批移动止盈</span>' : '<span class="text-[10px] text-slate-400">⚪ 趋势温和，可按定投节奏持有</span>')}
+                        ${dateUnknown ? '<span class="text-[10px] text-amber-300">买入日待确认，赎回前核对费率</span>' : (isLocked ? '<span class="text-[10px] text-amber-300">离7天解冻还差 ' + (7 - daysHeld) + ' 天，非大跌勿平仓</span>' : (estGrowth >= 2.0 ? '<span class="text-[10px] text-red-400 font-bold">短线动量极强，可锁定收益或分批移动止盈</span>' : '<span class="text-[10px] text-slate-400">趋势温和，可按定投节奏持有</span>'))}
                     </td>
                     <td class="py-2.5 px-3 text-right">
                         <button onclick="deleteHolding(${index})" class="text-xs text-red-400 hover:text-red-300 p-1 transition" title="删除此持仓">
@@ -693,11 +708,18 @@
                 if (!window.Tesseract) throw new Error('OCR 组件加载失败，请检查网络后重试');
                 progressText.textContent = '正在裁切并增强持仓区域...';
                 const ocrInput = await preprocessPortfolioScreenshot(file);
-                const result = await Tesseract.recognize(ocrInput, 'chi_sim+eng', {
+                const worker = await Tesseract.createWorker('chi_sim+eng', 1, {
                     logger: message => {
                         if (message.status === 'recognizing text') progressText.textContent = `正在识别截图文字：${Math.round((message.progress || 0) * 100)}%`;
                     }
                 });
+                let result;
+                try {
+                    await worker.setParameters({ tessedit_pageseg_mode: '6', preserve_interword_spaces: '1' });
+                    result = await worker.recognize(ocrInput);
+                } finally {
+                    await worker.terminate();
+                }
                 tempParsedOcrHoldings = parseOcrHoldings(result.data.text);
                 renderOcrRows();
                 loadingEl.classList.add('hidden');
@@ -1201,7 +1223,7 @@
                 const query = document.getElementById('manual-fund-query').value;
                 const matchFund = resolveCatalogFund(query);
                 const amt = parseFloat(document.getElementById('manual-hold-amount').value);
-                const dateVal = document.getElementById('manual-buy-date').value || todayStr;
+                const dateVal = document.getElementById('manual-buy-date').value || '';
                 if (!matchFund) { document.getElementById('manual-fund-match').textContent = '无法核验该基金，请输入 AkShare 目录中的代码或完整名称。'; return; }
                 if (!Number.isFinite(amt) || amt <= 0) { document.getElementById('manual-fund-match').textContent = '请填写有效的持仓金额。'; return; }
 
@@ -1225,10 +1247,10 @@
                     ...item,
                     holdAmount: parseFloat(rows[index]?.querySelector('.ocr-amount')?.value),
                     buyDate: rows[index]?.querySelector('.ocr-date')?.value || '',
-                })).filter(item => Number.isFinite(item.holdAmount) && item.holdAmount > 0 && item.buyDate);
+                })).filter(item => Number.isFinite(item.holdAmount) && item.holdAmount > 0);
                 if (confirmed.length !== tempParsedOcrHoldings.length || !confirmed.length) {
                     const title = document.querySelector('#ocr-preview-results > div');
-                    if (title) title.textContent = '请为每只基金填写有效持仓金额和真实买入确认日后再导入。';
+                    if (title) title.textContent = '请为每只基金填写有效持仓金额；截图没有日期时可以留空，稍后核对。';
                     return;
                 }
                 confirmed.forEach(item => {
@@ -1236,7 +1258,7 @@
                         code: item.fundCode,
                         name: item.fundName,
                         amount: item.holdAmount,
-                        buyDate: item.buyDate || todayStr,
+                        buyDate: item.buyDate,
                         totalProfit: item.totalProfit || 0
                     });
                 });
