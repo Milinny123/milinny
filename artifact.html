@@ -29,6 +29,7 @@
     </script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
         body { font-family: 'Inter', system-ui, -apple-system, sans-serif; }
@@ -210,7 +211,7 @@
                             <h3 class="font-bold text-slate-100 text-sm sm:text-base">全赛道高弹性场外 C 类监控池</h3>
                             <span class="text-xs bg-slate-800 text-slate-400 px-2 py-0.5 rounded-full font-mono border border-slate-700" id="total-fund-count">0 只</span>
                         </div>
-                        
+
                         <div class="flex items-center gap-2">
                             <div class="relative w-full sm:w-56">
                                 <i class="fa-solid fa-magnifying-glass absolute left-3 top-2.5 text-xs text-slate-500"></i>
@@ -258,7 +259,7 @@
                         </span>
                         <span class="text-[10px] bg-brand-500/20 text-brand-400 px-2 py-0.5 rounded-full border border-brand-500/30">风控核算</span>
                     </h3>
-                    
+
                     <div class="space-y-3 text-xs">
                         <div>
                             <label class="text-slate-400 block mb-1">当前可用试错总资金 (元)</label>
@@ -272,7 +273,7 @@
                                 <option value="20">20% (单笔 400元 - 主升浪重仓)</option>
                             </select>
                         </div>
-                        
+
                         <div class="p-3 bg-brand-500/10 border border-brand-500/20 rounded-xl space-y-2">
                             <div class="flex justify-between items-center text-slate-300">
                                 <span>今日支付宝建议买入:</span>
@@ -306,14 +307,14 @@
             <button id="btn-close-portfolio" class="absolute top-4 right-4 text-slate-400 hover:text-white text-lg">
                 <i class="fa-solid fa-xmark"></i>
             </button>
-            
+
             <div class="flex items-center gap-3 border-b border-slate-800 pb-3">
                 <div class="w-10 h-10 rounded-xl bg-emerald-500/20 text-emerald-400 flex items-center justify-center border border-emerald-500/30">
                     <i class="fa-solid fa-robot text-lg"></i>
                 </div>
                 <div>
                             <h3 class="font-bold text-white text-base">截图导入支付宝持仓</h3>
-                            <p class="text-xs text-slate-400">上传或按 Ctrl+V 粘贴截图作为记录参考；静态 Pages 不会伪造 OCR 识别结果</p>
+                            <p class="text-xs text-slate-400">OCR 提取截图文字，并使用每日更新的 AkShare 基金目录核验代码和名称</p>
                 </div>
             </div>
 
@@ -332,13 +333,13 @@
             <div id="ocr-status-container" class="hidden space-y-3 text-xs">
                 <div id="ocr-loading" class="p-6 text-center text-slate-400 animate-pulse space-y-2 bg-slate-900/80 rounded-xl">
                     <i class="fa-solid fa-circle-notch fa-spin text-2xl text-emerald-400"></i>
-                    <div>正在读取截图；请使用“手动添加”确认基金代码、金额和日期...</div>
+                    <div id="ocr-progress-text">正在加载中文 OCR 并读取截图...</div>
                 </div>
 
                 <div id="ocr-preview-results" class="hidden space-y-3">
                     <div class="font-bold text-emerald-400 flex items-center gap-1.5 text-xs">
                         <i class="fa-solid fa-circle-check"></i>
-                        截图已接收；请用“手动添加”录入并核对持仓，页面不会自动猜测代码：
+                        已识别以下基金。请逐项核对基金名称、金额和买入日期后再导入：
                     </div>
                     <div class="overflow-x-auto">
                         <table class="w-full text-left text-xs text-slate-300">
@@ -377,10 +378,10 @@
             </h3>
             <div class="space-y-3 text-xs">
                 <div>
-                    <label class="text-slate-400 block mb-1">选择或搜索基金</label>
-                    <select id="manual-fund-select" class="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-brand-500">
-                        <!-- Dynamic options -->
-                    </select>
+                    <label class="text-slate-400 block mb-1">基金代码或名称（不限推荐列表）</label>
+                    <input id="manual-fund-query" list="fund-catalog-options" autocomplete="off" placeholder="例如：012349 或 天弘恒生科技" class="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-brand-500">
+                    <datalist id="fund-catalog-options"></datalist>
+                    <p id="manual-fund-match" class="text-[11px] text-slate-500 mt-1">输入 6 位代码可精确核验。</p>
                 </div>
                 <div>
                     <label class="text-slate-400 block mb-1">持仓金额 (元)</label>
@@ -413,7 +414,7 @@
             <button id="btn-close-ai" class="absolute top-4 right-4 text-slate-400 hover:text-white text-lg">
                 <i class="fa-solid fa-xmark"></i>
             </button>
-            
+
             <div class="flex items-center gap-3 border-b border-slate-800 pb-3">
                 <div class="w-9 h-9 rounded-xl bg-brand-600/20 text-brand-400 flex items-center justify-center border border-brand-500/30">
                     <i class="fa-solid fa-robot text-base"></i>
@@ -442,6 +443,89 @@
         let userHoldings = JSON.parse(localStorage.getItem('user_holdings_v1') || '[]');
 
         let tempParsedOcrHoldings = [];
+        let fundCatalog = [];
+
+        function normalizeFundText(value) {
+            return String(value || '').toLowerCase().replace(/etf|联接|发起式|指数|证券投资基金|基金|人民币份额|[\s·()（）\-_/]/g, '');
+        }
+
+        function resolveCatalogFund(query) {
+            const raw = String(query || '').trim();
+            const code = (raw.match(/(?:^|\D)(\d{6})(?:\D|$)/) || [])[1];
+            if (code) {
+                const exact = fundCatalog.find(item => item.code === code);
+                if (exact) return { ...exact, confidence: '代码精确匹配' };
+            }
+            const normalized = normalizeFundText(raw);
+            if (normalized.length < 3) return null;
+            const matches = fundCatalog
+                .map(item => {
+                    const name = normalizeFundText(item.name);
+                    const overlap = name.includes(normalized) || normalized.includes(name);
+                    const common = [...new Set(normalized)].filter(char => name.includes(char)).length;
+                    const score = overlap ? 1 : common / Math.max(name.length, normalized.length);
+                    return { item, score };
+                })
+                .filter(match => match.score >= 0.58)
+                .sort((a, b) => b.score - a.score || b.item.name.length - a.item.name.length);
+            return matches.length ? { ...matches[0].item, confidence: matches[0].score >= 0.9 ? '名称高置信匹配' : '名称候选，请核对' } : null;
+        }
+
+        function extractAmount(text, fundCode) {
+            const cleaned = String(text || '').replace(fundCode || '', ' ');
+            const labelled = cleaned.match(/(?:持有金额|持仓金额|总金额|市值|金额)[：:\s¥￥]*([\d,]+(?:\.\d{1,2})?)/);
+            if (labelled) return Number(labelled[1].replace(/,/g, ''));
+            const values = [...cleaned.matchAll(/[¥￥]\s*([\d,]+(?:\.\d{1,2})?)/g)]
+                .map(match => Number(match[1].replace(/,/g, '')))
+                .filter(value => value > 0);
+            return values[0] || null;
+        }
+
+        function parseOcrHoldings(text) {
+            const lines = String(text || '').split(/\n+/).map(line => line.trim()).filter(Boolean);
+            const found = new Map();
+            lines.forEach((line, index) => {
+                const nearby = lines.slice(Math.max(0, index - 1), index + 3).join(' ');
+                const codes = [...line.matchAll(/(?:^|\D)(\d{6})(?:\D|$)/g)].map(match => match[1]);
+                codes.forEach(code => {
+                    const fund = fundCatalog.find(item => item.code === code);
+                    if (fund && !found.has(code)) {
+                        found.set(code, { fundCode: code, fundName: fund.name, holdAmount: extractAmount(nearby, code), buyDate: '', totalProfit: 0, confidence: '代码精确匹配' });
+                    }
+                });
+                if (!codes.length) {
+                    const fund = resolveCatalogFund(line);
+                    if (fund && !found.has(fund.code)) {
+                        found.set(fund.code, { fundCode: fund.code, fundName: fund.name, holdAmount: extractAmount(nearby, fund.code), buyDate: '', totalProfit: 0, confidence: fund.confidence });
+                    }
+                }
+            });
+            return [...found.values()];
+        }
+
+        function renderOcrRows() {
+            const tbody = document.getElementById('ocr-parsed-tbody');
+            tbody.replaceChildren();
+            if (!tempParsedOcrHoldings.length) {
+                const row = document.createElement('tr');
+                const cell = document.createElement('td');
+                cell.colSpan = 5;
+                cell.className = 'py-4 px-2 text-amber-300';
+                cell.textContent = '没有可靠识别到基金。请换一张包含基金名称或 6 位代码的清晰截图，或使用手动添加。';
+                row.appendChild(cell); tbody.appendChild(row); return;
+            }
+            tempParsedOcrHoldings.forEach((item, index) => {
+                const row = document.createElement('tr');
+                row.innerHTML = `<td class="py-2 px-2"><strong class="text-white"></strong><small class="block text-amber-300"></small></td><td class="py-2 px-2 font-mono"></td><td class="py-2 px-2"><input type="number" min="0.01" step="0.01" class="ocr-amount w-24 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-white"></td><td class="py-2 px-2"><input type="date" class="ocr-date bg-slate-900 border border-slate-700 rounded px-2 py-1 text-white"></td><td class="py-2 px-2"><button type="button" class="ocr-remove text-red-400" title="移除此项"><i class="fa-solid fa-trash"></i></button></td>`;
+                row.querySelector('strong').textContent = item.fundName;
+                row.querySelector('small').textContent = item.confidence;
+                row.children[1].textContent = item.fundCode;
+                row.querySelector('.ocr-amount').value = item.holdAmount || '';
+                row.querySelector('.ocr-date').value = item.buyDate || '';
+                row.querySelector('.ocr-remove').addEventListener('click', () => { tempParsedOcrHoldings.splice(index, 1); renderOcrRows(); });
+                tbody.appendChild(row);
+            });
+        }
 
         function saveUserHoldings() {
             localStorage.setItem('user_holdings_v1', JSON.stringify(userHoldings));
@@ -535,30 +619,43 @@
             const estEl = document.getElementById('port-est-profit');
             estEl.innerText = `${totalEstProfit >= 0 ? '+' : ''}￥${totalEstProfit.toFixed(2)}`;
             estEl.className = `text-lg font-bold ${totalEstProfit >= 0 ? 'text-red-500' : 'text-emerald-500'}`;
-            
+
             document.getElementById('port-total-profit').innerText = `￥${totalHistProfit.toFixed(2)}`;
             document.getElementById('port-penalty-warning').innerText = `${penaltyCount} 只锁定中`;
             document.getElementById('user-holding-count-badge').innerText = `${userHoldings.length} 只持仓标的`;
         }
 
-        function handleFileSelect(file) {
+        async function handleFileSelect(file) {
             if (!file) return;
             const statusContainer = document.getElementById('ocr-status-container');
             const loadingEl = document.getElementById('ocr-loading');
             const resultsEl = document.getElementById('ocr-preview-results');
-            const tbody = document.getElementById('ocr-parsed-tbody');
+            const progressText = document.getElementById('ocr-progress-text');
 
             statusContainer.classList.remove('hidden');
             loadingEl.classList.remove('hidden');
             resultsEl.classList.add('hidden');
 
-            setTimeout(() => {
+            try {
+                if (!fundCatalog.length) throw new Error('基金目录尚未加载，请刷新页面后重试');
+                if (!window.Tesseract) throw new Error('OCR 组件加载失败，请检查网络后重试');
+                const result = await Tesseract.recognize(file, 'chi_sim+eng', {
+                    logger: message => {
+                        if (message.status === 'recognizing text') progressText.textContent = `正在识别截图文字：${Math.round((message.progress || 0) * 100)}%`;
+                    }
+                });
+                tempParsedOcrHoldings = parseOcrHoldings(result.data.text);
+                renderOcrRows();
                 loadingEl.classList.add('hidden');
                 resultsEl.classList.remove('hidden');
-
+            } catch (error) {
+                loadingEl.classList.add('hidden');
+                resultsEl.classList.remove('hidden');
                 tempParsedOcrHoldings = [];
-                tbody.innerHTML = '<tr><td colspan="5" class="py-4 px-2 text-amber-300">截图预览完成。为避免错误映射，请关闭此窗口后使用“手动添加”录入代码、金额和买入日期。</td></tr>';
-            }, 1500);
+                renderOcrRows();
+                const cell = document.querySelector('#ocr-parsed-tbody td');
+                if (cell) cell.textContent = error.message || '截图识别失败，请重试';
+            }
         }
 
         // 22 热门高弹性 C 类基金完整监控池数据
@@ -620,6 +717,19 @@
                     freshness: item.data_freshness || '历史净值/行情'
                 })).sort((a, b) => b.score - a.score);
                 if (liveData.length) processedData = liveData;
+                fundCatalog = Array.isArray(payload.fund_catalog) ? payload.fund_catalog : [];
+                if (!fundCatalog.length) {
+                    fundCatalog = liveData.map(item => ({ code: item.code, name: item.name }));
+                }
+                const options = document.getElementById('fund-catalog-options');
+                if (options) {
+                    options.replaceChildren();
+                    fundCatalog.forEach(item => {
+                        const option = document.createElement('option');
+                        option.value = `${item.code} ${item.name}`;
+                        options.appendChild(option);
+                    });
+                }
                 if (Array.isArray(payload.holdings) && payload.holdings.length) {
                     userHoldings = payload.holdings.map(item => ({
                         code: item.code,
@@ -1015,11 +1125,8 @@
             });
             document.getElementById('btn-close-portfolio')?.addEventListener('click', () => closeModal('modal-portfolio'));
             document.getElementById('btn-add-manual-holding')?.addEventListener('click', () => {
-                const select = document.getElementById('manual-fund-select');
-                select.innerHTML = '';
-                processedData.forEach(f => {
-                    select.innerHTML += `<option value="${f.code}">${f.name} (${f.code})</option>`;
-                });
+                document.getElementById('manual-fund-query').value = '';
+                document.getElementById('manual-fund-match').textContent = '输入 6 位代码可精确核验。';
                 document.getElementById('manual-buy-date').value = todayStr;
                 document.getElementById('modal-manual-holding').classList.remove('hidden');
             });
@@ -1028,36 +1135,58 @@
             document.getElementById('btn-close-ai')?.addEventListener('click', () => closeModal('modal-ai-report'));
             document.getElementById('btn-open-ai-report')?.addEventListener('click', generateAIReport);
 
+            document.getElementById('manual-fund-query')?.addEventListener('input', event => {
+                const match = resolveCatalogFund(event.target.value);
+                const label = document.getElementById('manual-fund-match');
+                label.textContent = match ? `${match.name} (${match.code}) · ${match.confidence}` : '未匹配，请输入完整 6 位代码或更完整的基金名称。';
+                label.className = `text-[11px] mt-1 ${match ? 'text-emerald-400' : 'text-amber-400'}`;
+            });
+
             // Manual save
             document.getElementById('btn-save-manual-holding')?.addEventListener('click', () => {
-                const select = document.getElementById('manual-fund-select');
-                const amt = parseFloat(document.getElementById('manual-hold-amount').value) || 1000;
+                const query = document.getElementById('manual-fund-query').value;
+                const matchFund = resolveCatalogFund(query);
+                const amt = parseFloat(document.getElementById('manual-hold-amount').value);
                 const dateVal = document.getElementById('manual-buy-date').value || todayStr;
-                const matchFund = processedData.find(f => f.code === select.value);
+                if (!matchFund) { document.getElementById('manual-fund-match').textContent = '无法核验该基金，请输入 AkShare 目录中的代码或完整名称。'; return; }
+                if (!Number.isFinite(amt) || amt <= 0) { document.getElementById('manual-fund-match').textContent = '请填写有效的持仓金额。'; return; }
 
                 userHoldings.push({
-                    code: select.value,
-                    name: matchFund ? matchFund.name : "自定义基金",
+                    code: matchFund.code,
+                    name: matchFund.name,
                     amount: amt,
                     buyDate: dateVal,
                     totalProfit: 0
                 });
 
+                saveUserHoldings();
                 renderUserHoldings();
                 closeModal('modal-manual-holding');
             });
 
             // OCR confirm & cancel
             document.getElementById('btn-confirm-ocr')?.addEventListener('click', () => {
-                tempParsedOcrHoldings.forEach(item => {
+                const rows = [...document.querySelectorAll('#ocr-parsed-tbody tr')];
+                const confirmed = tempParsedOcrHoldings.map((item, index) => ({
+                    ...item,
+                    holdAmount: parseFloat(rows[index]?.querySelector('.ocr-amount')?.value),
+                    buyDate: rows[index]?.querySelector('.ocr-date')?.value || '',
+                })).filter(item => Number.isFinite(item.holdAmount) && item.holdAmount > 0 && item.buyDate);
+                if (confirmed.length !== tempParsedOcrHoldings.length || !confirmed.length) {
+                    const title = document.querySelector('#ocr-preview-results > div');
+                    if (title) title.textContent = '请为每只基金填写有效持仓金额和真实买入确认日后再导入。';
+                    return;
+                }
+                confirmed.forEach(item => {
                     userHoldings.push({
-                        code: item.fundCode || "012616",
+                        code: item.fundCode,
                         name: item.fundName,
-                        amount: item.holdAmount || 1000,
+                        amount: item.holdAmount,
                         buyDate: item.buyDate || todayStr,
                         totalProfit: item.totalProfit || 0
                     });
                 });
+                saveUserHoldings();
                 renderUserHoldings();
                 closeModal('modal-portfolio');
                 document.getElementById('ocr-status-container').classList.add('hidden');

@@ -19,7 +19,9 @@ import requests
 
 
 BEIJING_TZ = timezone(timedelta(hours=8))
-HISTORY_ROWS = 150
+# Two trading years give the walk-forward check materially more observations
+# than the former 150-row window while keeping GitHub Actions runtime bounded.
+HISTORY_ROWS = 400
 RISK_PROFILE = os.getenv("RISK_PROFILE", "aggressive").strip().lower()
 if RISK_PROFILE not in {"balanced", "aggressive"}:
     RISK_PROFILE = "aggressive"
@@ -94,6 +96,7 @@ T0_ETF_ALLOWLIST: dict[str, dict[str, str]] = {
 _ETF_SPOT_CACHE: pd.DataFrame | None = None
 _ETF_SPOT_INDEX: dict[str, dict[str, Any]] | None = None
 _FUND_ESTIMATION_CACHE: dict[str, dict[str, Any]] | None = None
+_FUND_CATALOG_CACHE: pd.DataFrame | None = None
 
 # Codes are checked against AKShare's fund catalog at runtime.  The catalog is
 # authoritative for the current name; an invalid or mismatched entry is skipped.
@@ -255,6 +258,8 @@ def _sina_symbol(code: str) -> str:
 
 
 def _history_attempts(code: str, kind: str) -> list[Callable[[], Any]]:
+    start_date = (datetime.now() - timedelta(days=650)).strftime("%Y%m%d")
+    end_date = datetime.now().strftime("%Y%m%d")
     if _is_alipay_fund(kind):
         return [
             lambda: ak.fund_open_fund_info_em(symbol=code, indicator="单位净值走势"),
@@ -265,8 +270,8 @@ def _history_attempts(code: str, kind: str) -> list[Callable[[], Any]]:
             lambda: ak.fund_etf_hist_em(
                 symbol=code,
                 period="daily",
-                start_date=(datetime.now() - timedelta(days=260)).strftime("%Y%m%d"),
-                end_date=datetime.now().strftime("%Y%m%d"),
+                start_date=start_date,
+                end_date=end_date,
                 adjust="qfq",
             ),
             lambda: ak.fund_etf_hist_sina(symbol=_sina_symbol(code)),
@@ -276,8 +281,8 @@ def _history_attempts(code: str, kind: str) -> list[Callable[[], Any]]:
         lambda: ak.fund_etf_hist_em(
             symbol=code,
             period="daily",
-            start_date=(datetime.now() - timedelta(days=260)).strftime("%Y%m%d"),
-            end_date=datetime.now().strftime("%Y%m%d"),
+            start_date=start_date,
+            end_date=end_date,
             adjust="qfq",
         ),
         # 新浪接口作为不同数据源的备用；其价格序列没有 qfq 参数，优先级低于东财。
@@ -285,8 +290,8 @@ def _history_attempts(code: str, kind: str) -> list[Callable[[], Any]]:
         lambda: ak.stock_zh_a_hist(
             symbol=code,
             period="daily",
-            start_date=(datetime.now() - timedelta(days=260)).strftime("%Y%m%d"),
-            end_date=datetime.now().strftime("%Y%m%d"),
+            start_date=start_date,
+            end_date=end_date,
             adjust="qfq",
         ),
     ]
@@ -552,6 +557,9 @@ def scan_intraday_t0(failures: list[str]) -> list[dict[str, Any]]:
 
 
 def _fund_catalog() -> pd.DataFrame:
+    global _FUND_CATALOG_CACHE
+    if _FUND_CATALOG_CACHE is not None:
+        return _FUND_CATALOG_CACHE.copy()
     attempts = [
         lambda: ak.fund_name_em(),
         lambda: ak.fund_open_fund_daily_em(),
@@ -566,7 +574,14 @@ def _fund_catalog() -> pd.DataFrame:
             name_col = _first_existing(frame, ("基金简称", "名称", "fund_name"))
             if not code_col or not name_col:
                 raise ValueError(f"基金目录缺少代码/名称列: {list(frame.columns)}")
-            return frame[[code_col, name_col]].rename(columns={code_col: "code", name_col: "name"})
+            catalog = frame[[code_col, name_col]].rename(
+                columns={code_col: "code", name_col: "name"}
+            )
+            catalog["code"] = catalog["code"].astype(str).str.extract(r"(\d{6})", expand=False)
+            catalog["name"] = catalog["name"].astype(str).str.strip()
+            catalog = catalog.dropna().drop_duplicates("code")
+            _FUND_CATALOG_CACHE = catalog.reset_index(drop=True)
+            return _FUND_CATALOG_CACHE.copy()
         except Exception as exc:
             errors.append(_short_error(exc))
     raise RuntimeError("；".join(errors))
@@ -686,6 +701,33 @@ def _return(close: pd.Series, days: int) -> float:
     return (float(close.iloc[-1]) / float(close.iloc[-1 - days]) - 1) * 100
 
 
+def _merge_live_price(history: pd.DataFrame, price: float, quote_date: datetime.date) -> pd.DataFrame:
+    """Merge a live quote without overwriting the previous trading day's close."""
+    merged = history.copy()
+    last_date = pd.Timestamp(merged["date"].iloc[-1]).date()
+    if quote_date > last_date:
+        merged = pd.concat(
+            [merged, pd.DataFrame({"date": [pd.Timestamp(quote_date)], "close": [float(price)]})],
+            ignore_index=True,
+        )
+    else:
+        merged.loc[merged.index[-1], "close"] = float(price)
+    return merged.tail(HISTORY_ROWS).reset_index(drop=True)
+
+
+def _wilson_lower_bound(wins: int, observations: int, z: float = 1.2816) -> float:
+    """Return a conservative binomial win-rate bound (80% two-sided interval)."""
+    if observations <= 0:
+        return 0.0
+    probability = wins / observations
+    denominator = 1 + z * z / observations
+    centre = probability + z * z / (2 * observations)
+    margin = z * math.sqrt(
+        probability * (1 - probability) / observations + z * z / (4 * observations**2)
+    )
+    return max(0.0, (centre - margin) / denominator) * 100
+
+
 def _rolling_entry_backtest(close: pd.Series) -> dict[str, Any]:
     """Walk forward through history and score the same non-chasing entry rule."""
     outcomes: list[tuple[float, float]] = []
@@ -722,6 +764,8 @@ def _rolling_entry_backtest(close: pd.Series) -> dict[str, Any]:
             "backtest_avg3": None,
             "backtest_avg5": None,
             "backtest_worst5": None,
+            "backtest_win3_lower": 0.0,
+            "backtest_win5_lower": 0.0,
         }
     three_day = [item[0] for item in outcomes]
     five_day = [item[1] for item in outcomes]
@@ -732,6 +776,8 @@ def _rolling_entry_backtest(close: pd.Series) -> dict[str, Any]:
         "backtest_avg3": sum(three_day) / len(three_day),
         "backtest_avg5": sum(five_day) / len(five_day),
         "backtest_worst5": min(five_day),
+        "backtest_win3_lower": _wilson_lower_bound(sum(value > 0 for value in three_day), len(outcomes)),
+        "backtest_win5_lower": _wilson_lower_bound(sum(value > 0 for value in five_day), len(outcomes)),
     }
 
 
@@ -745,13 +791,14 @@ def analyse_item(
     history, data_code, source = fetch_item_history(item)
     if len(history) < 61:
         raise ValueError(f"有效数据 {len(history)} 条，少于 61 条")
+    official_data_date = history["date"].iloc[-1].date()
     quote = (realtime_quotes or {}).get(item["code"], {}) if item["kind"] == "etf" else {}
-    close = history["close"].copy()
     quote_price = quote.get("quote_price")
     if quote_price is not None:
-        # Keep historical dates for trend/backtest, but replace only today's
-        # terminal value so 1/3/5/20-day returns reflect the live ETF quote.
-        close.iloc[-1] = float(quote_price)
+        history = _merge_live_price(
+            history, float(quote_price), as_of.astimezone(BEIJING_TZ).date()
+        )
+    close = history["close"].copy()
     returns = {days: _return(close, days) for days in (1, 3, 5, 20, 60)}
     daily_returns = close.pct_change().dropna().tail(20) * 100
     max_daily_gain20 = float(daily_returns.max())
@@ -762,8 +809,7 @@ def analyse_item(
     ma60 = float(close.tail(60).mean())
     high20 = float(close.tail(20).max())
     drawdown = (latest / high20 - 1) * 100
-    data_date = history["date"].iloc[-1].date()
-    data_age_days = (as_of.astimezone(BEIJING_TZ).date() - data_date).days
+    data_age_days = (as_of.astimezone(BEIJING_TZ).date() - official_data_date).days
     effective_age_days = 0 if quote_price is not None else data_age_days
     score = (
         returns[5] * MOMENTUM_WEIGHTS[0]
@@ -804,7 +850,9 @@ def analyse_item(
     else:
         backtest_quality = 0.0
     freshness_quality = 1.0 if quote_price is not None or est_growth is not None else max(0.0, 1 - data_age_days / 10)
-    prediction_quality = round(100 * (trend_agreement * 0.35 + backtest_quality * 0.4 + freshness_quality * 0.25), 1)
+    completeness_quality = min(1.0, len(history) / HISTORY_ROWS)
+    data_quality = round(100 * (freshness_quality * 0.55 + completeness_quality * 0.45), 1)
+    evidence_quality = round(100 * (backtest_quality * 0.65 + trend_agreement * 0.35), 1)
     data_freshness = (
         "实时 ETF 行情" if quote_price is not None
         else ("盘中净值估算" if est_growth is not None else "历史净值/行情")
@@ -813,12 +861,16 @@ def analyse_item(
         **item,
         "data_code": data_code,
         "source": source,
-        "data_date": data_date.isoformat(),
+        "data_date": official_data_date.isoformat(),
         "data_age_days": effective_age_days,
         "stale": effective_age_days > MAX_DATA_AGE_DAYS,
         "data_freshness": data_freshness,
-        "prediction_quality": prediction_quality,
-        "quality_label": "高" if prediction_quality >= 70 else ("中" if prediction_quality >= 50 else "低"),
+        "data_quality": data_quality,
+        "evidence_quality": evidence_quality,
+        # Retained for dashboard compatibility; this is evidence strength, not accuracy.
+        "prediction_quality": evidence_quality,
+        "quality_label": "高" if evidence_quality >= 70 else ("中" if evidence_quality >= 50 else "低"),
+        "history_observations": len(history),
         "quote_price": quote_price,
         "quote_turnover": quote.get("quote_turnover"),
         "quote_date": as_of.astimezone(BEIJING_TZ).date().isoformat() if quote_price is not None else None,
@@ -855,6 +907,38 @@ def analyse_item(
     }
 
 
+def _percentile_scores(results: list[dict[str, Any]], field: str) -> dict[int, float]:
+    series = pd.Series([float(item[field]) for item in results])
+    ranks = series.rank(method="average", pct=True) * 100
+    return {id(item): float(ranks.iloc[index]) for index, item in enumerate(results)}
+
+
+def _calculate_composite_scores(results: list[dict[str, Any]]) -> None:
+    """Create a cross-sectional score from independent return, risk and evidence dimensions."""
+    if not results:
+        return
+    momentum = _percentile_scores(results, "score")
+    relative_strength = _percentile_scores(results, "rs_score")
+    burst = _percentile_scores(results, "burst_score")
+    volatility = _percentile_scores(results, "daily_volatility20")
+    drawdown = _percentile_scores(results, "drawdown")
+    for item in results:
+        trend = sum((item["above_ma20"], item["above_ma60"], item["rs20"] > 0, item["rs60"] > 0)) / 4 * 100
+        risk = drawdown[id(item)] * 0.65 + (100 - volatility[id(item)]) * 0.35
+        evidence = min(100.0, item["evidence_quality"])
+        live_weight = 0.08 if RISK_PROFILE == "aggressive" else 0.04
+        item["composite_score"] = round(
+            momentum[id(item)] * 0.30
+            + relative_strength[id(item)] * 0.22
+            + trend * 0.18
+            + risk * 0.12
+            + evidence * (0.18 - live_weight)
+            + burst[id(item)] * live_weight,
+            2,
+        )
+        item["selection_score"] = item["composite_score"]
+
+
 def _rank_results(results: list[dict[str, Any]]) -> None:
     if not results:
         return
@@ -889,13 +973,11 @@ def _rank_results(results: list[dict[str, Any]]) -> None:
                 item["backtest_signals"] >= MIN_BACKTEST_SIGNALS
                 and (
                     (
-                        item["backtest_win3"] is not None
-                        and item["backtest_win3"] >= 52
+                        item["backtest_win3_lower"] >= 45
                         and item["backtest_avg3"] > 0
                     )
                     or (
-                        item["backtest_win5"] is not None
-                        and item["backtest_win5"] >= 52
+                        item["backtest_win5_lower"] >= 45
                         and item["backtest_avg5"] > 0
                     )
                 )
@@ -920,8 +1002,7 @@ def _rank_results(results: list[dict[str, Any]]) -> None:
                 HIGH_CONVICTION_BUY
                 if (
                     item["pool_percentile"] >= 80
-                    and item["backtest_win3"] is not None
-                    and item["backtest_win3"] >= 60
+                    and item["backtest_win3_lower"] >= 52
                     and item["backtest_avg3"] >= 0.5
                 )
                 else STANDARD_BUY
@@ -1297,7 +1378,16 @@ def analyse_market(now: datetime | None = None) -> dict[str, Any]:
             if benchmark_age > MAX_DATA_AGE_DAYS:
                 failures.append(f"沪深300基准数据过期：最新日期 {benchmark_date}")
             else:
-                benchmark_returns = {days: _return(benchmark_history["close"], days) for days in (5, 20, 60)}
+                benchmark_quote = realtime_quotes.get(BENCHMARK["code"], {}).get("quote_price")
+                if benchmark_quote is not None:
+                    benchmark_history = _merge_live_price(
+                        benchmark_history,
+                        float(benchmark_quote),
+                        now.astimezone(BEIJING_TZ).date(),
+                    )
+                benchmark_returns = {
+                    days: _return(benchmark_history["close"], days) for days in (5, 20, 60)
+                }
     except Exception as exc:
         failures.append(f"沪深300基准：{_short_error(exc)}")
 
@@ -1307,6 +1397,7 @@ def analyse_market(now: datetime | None = None) -> dict[str, Any]:
             results.append(analyse_item(item, benchmark_returns, now, intraday_estimations, realtime_quotes))
         except Exception as exc:
             failures.append(f"{item['code']} {item['name']}：{_short_error(exc)}")
+    _calculate_composite_scores(results)
     _rank_results(results)
     holding_codes = {position["code"] for position in holdings}
     invested_amount = sum(position["amount"] for position in holdings)
@@ -1332,6 +1423,11 @@ def analyse_market(now: datetime | None = None) -> dict[str, Any]:
         "holdings": enriched_holdings,
         "invested_amount": invested_amount,
         "remaining_cash": max(0.0, TOTAL_CAPITAL - invested_amount),
+        "fund_catalog": (
+            _FUND_CATALOG_CACHE.to_dict("records")
+            if _FUND_CATALOG_CACHE is not None
+            else []
+        ),
     }
 
 
@@ -1395,6 +1491,7 @@ def _backtest_text(item: dict[str, Any]) -> str:
         f"同规则回测 {item['backtest_signals']} 次，3/5日胜率 "
         f"{item['backtest_win3']:.1f}% / {item['backtest_win5']:.1f}%（平均 "
         f"{item['backtest_avg3']:.2f}% / {item['backtest_avg5']:.2f}%，"
+        f"保守胜率下界 {item['backtest_win3_lower']:.1f}% / {item['backtest_win5_lower']:.1f}%，"
         f"最差5日 {item['backtest_worst5']:.2f}%）"
     )
 
@@ -1412,9 +1509,9 @@ def _line(item: dict[str, Any]) -> str:
         f"{item['r1']:.2f}% / {item['r3']:.2f}% / {item['r5']:.2f}% / {item['r20']:.2f}% / {item['r60']:.2f}%，"
         f"近20日最大单日上涨 **{item['max_daily_gain20']:.2f}%**（≥{TARGET_DAILY_MOVE:.1f}% 共 {item['target_move_days20']} 次），"
         f"日波动率 {item['daily_volatility20']:.2f}%，"
-        f"池内分位 **{item['pool_percentile']:.1f}%**（约前 {item['pool_top_percent']}%）；"
+        f"综合评分 **{item['composite_score']:.2f}/100**，池内分位 **{item['pool_percentile']:.1f}%**（约前 {item['pool_top_percent']}%）；"
         f"数据日期 {item['data_date']}，{trend}，相对沪深300超额20/60日 {item['rs20']:.2f}% / {item['rs60']:.2f}%，"
-        f"回撤 {item['drawdown']:.2f}%；{manager}；次日情景区间 "
+        f"回撤 {item['drawdown']:.2f}%；数据质量 {item['data_quality']:.0f}/100，历史证据 {item['evidence_quality']:.0f}/100；{manager}；次日情景区间 "
         f"{item.get('next_day_low', 0):.2f}%～{item.get('next_day_high', 0):.2f}%（{item.get('forecast_confidence', '低')}置信度），"
         f"{_backtest_text(item)}，**{_action_text(item)}**。"
     )
@@ -1559,7 +1656,7 @@ def _dashboard_row(item: dict[str, Any]) -> str:
         f"<tr data-kind='{html.escape(item['kind'])}' data-sector='{html.escape(item['sector'])}'><td>{item['rank']}</td>"
         f"<td><strong>{html.escape(item['name'])}</strong><small>{html.escape(item['code'])} · {kind_label} · {html.escape(item['sector'])}</small></td>"
         f"<td>{html.escape(item['data_date'])}</td>"
-        f"<td>{item['intraday_growth']:.2f}%<small>{html.escape(item['est_source'])} · 质量 {item.get('prediction_quality', 0):.0f}/100</small></td>"
+        f"<td>{item['intraday_growth']:.2f}%<small>{html.escape(item['est_source'])} · 数据 {item.get('data_quality', 0):.0f}/100 · 证据 {item.get('evidence_quality', 0):.0f}/100</small></td>"
         f"<td>{item['r1']:.2f}%</td><td>{item['max_daily_gain20']:.2f}%<small>达标 {item['target_move_days20']} 次</small></td>"
         f"<td>{item['burst_score']:.2f}</td><td>{item['pool_percentile']:.1f}%</td>"
         f"<td>{item['r20']:.2f}%<br><small>RS {item['rs20']:.2f}%</small></td>"
@@ -1640,7 +1737,7 @@ def _dashboard_decision_card(item: dict[str, Any]) -> str:
         f"<span>建议金额<strong>{item.get('amount', 0):.0f} 元</strong></span>"
         f"<span>计划持有<strong>{html.escape(holding)}</strong></span>"
         f"<span>次日情景<strong>{item.get('next_day_low', 0):.2f}% ～ {item.get('next_day_high', 0):.2f}%</strong></span></div>"
-        f"<p>{html.escape(action)}</p><small>{html.escape(manager)}；{html.escape(_backtest_text(item))}；数据{html.escape(item.get('data_freshness', '待核验'))}；质量 {item.get('prediction_quality', 0):.0f}/100；情景估计为{item.get('forecast_confidence', '低')}置信度，不是收益保证。</small>"
+        f"<p>{html.escape(action)}</p><small>{html.escape(manager)}；{html.escape(_backtest_text(item))}；数据{html.escape(item.get('data_freshness', '待核验'))}，质量 {item.get('data_quality', 0):.0f}/100，历史证据 {item.get('evidence_quality', 0):.0f}/100；情景估计为{item.get('forecast_confidence', '低')}置信度，不是收益保证。</small>"
         "</article>"
     )
 
@@ -1658,9 +1755,12 @@ def build_dashboard(context: dict[str, Any], title: str) -> str:
         "intraday_t0": context.get("intraday_t0", []),
         "realtime_quote_count": context.get("realtime_quote_count", 0),
         "intraday_estimation_count": context.get("intraday_estimation_count", 0),
-        "holdings": context.get("holdings", []),
-        "invested_amount": context.get("invested_amount", 0),
-        "remaining_cash": context.get("remaining_cash", TOTAL_CAPITAL),
+        # The generated page is published publicly. Personal positions remain
+        # in the private report/repository and in browser-local storage only.
+        "holdings": [],
+        "invested_amount": 0,
+        "remaining_cash": TOTAL_CAPITAL,
+        "fund_catalog": context.get("fund_catalog", []),
         "failures": context["failures"],
     }
     data_json = json.dumps(payload, ensure_ascii=False, default=str).replace("</", "<\\/")
@@ -1675,7 +1775,7 @@ def build_dashboard(context: dict[str, Any], title: str) -> str:
     decision_cards = "".join(_dashboard_decision_card(item) for item in decision_items)
     failures = "".join(f"<li>{html.escape(failure)}</li>" for failure in context["failures"])
     intraday = context.get("intraday_t0", [])
-    holdings = context.get("holdings", [])
+    holdings: list[dict[str, Any]] = []
     holding_rows = "".join(_dashboard_holding_row(position) for position in holdings)
     intraday_rows = "".join(
         f"<tr><td><strong>{html.escape(item['name'])}</strong><small>{item['code']} · {item['category']}</small></td>"
