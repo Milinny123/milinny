@@ -491,16 +491,22 @@
         function parseOcrHoldings(text) {
             const lines = String(text || '').split(/\n+/).map(line => line.trim()).filter(Boolean);
             const found = new Map();
+            const exactCodes = [];
             lines.forEach((line, index) => {
                 const nearby = lines.slice(Math.max(0, index - 1), index + 3).join(' ');
                 const codes = [...line.matchAll(/(?:^|\D)(\d{6})(?:\D|$)/g)].map(match => match[1]);
                 codes.forEach(code => {
                     const fund = fundCatalog.find(item => item.code === code);
                     if (fund && !found.has(code)) {
+                        exactCodes.push(code);
                         found.set(code, { fundCode: code, fundName: fund.name, holdAmount: extractAmount(nearby, code), buyDate: '', totalProfit: 0, confidence: '代码精确匹配' });
                     }
                 });
-                if (!codes.length) {
+            });
+            if (exactCodes.length) return [...found.values()];
+            lines.forEach((line, index) => {
+                const nearby = lines.slice(Math.max(0, index - 1), index + 3).join(' ');
+                if (!/\d{6}/.test(line)) {
                     const fund = resolveCatalogFund(line);
                     if (fund && !found.has(fund.code)) {
                         found.set(fund.code, { fundCode: fund.code, fundName: fund.name, holdAmount: extractAmount(nearby, fund.code), buyDate: '', totalProfit: 0, confidence: fund.confidence });
