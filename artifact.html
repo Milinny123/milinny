@@ -479,9 +479,16 @@
 
         async function decodeFundCatalog(encoded) {
             if (!encoded || !window.DecompressionStream) return [];
-            const bytes = Uint8Array.from(atob(encoded), char => char.charCodeAt(0));
-            const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
-            return JSON.parse(await new Response(stream).text());
+            try {
+                const bytes = Uint8Array.from(atob(encoded), char => char.charCodeAt(0));
+                const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+                return JSON.parse(await new Response(stream).text());
+            } catch (error) {
+                // Older mobile WebKit builds may expose the API but fail gzip
+                // decoding; the live result set is still enough to render the dashboard.
+                console.warn('基金目录解压失败，使用行情结果继续加载', error);
+                return [];
+            }
         }
 
         function normalizeFundText(value) {
