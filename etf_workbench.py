@@ -569,7 +569,7 @@ def _fund_catalog() -> pd.DataFrame:
     errors: list[str] = []
     for attempt in attempts:
         try:
-            frame = _ak_call(attempt)
+            frame = _ak_call(attempt, seconds=30)
             if frame is None or frame.empty:
                 raise ValueError("基金目录为空")
             code_col = _first_existing(frame, ("基金代码", "代码", "fund_code"))
@@ -1368,6 +1368,11 @@ def analyse_market(now: datetime | None = None) -> dict[str, Any]:
         holdings = []
         failures.append(f"持仓文件：{_short_error(exc)}")
     watchlist, dynamic_count = build_watchlist(failures, holdings)
+    if _FUND_CATALOG_CACHE is None:
+        try:
+            _fund_catalog()
+        except Exception as exc:
+            failures.append(f"OCR 全基金目录：{_short_error(exc)}")
     intraday_estimations = fund_intraday_estimations(failures)
     realtime_quotes = etf_realtime_snapshot(failures)
     benchmark_returns: dict[int, float] = {}
@@ -1844,6 +1849,8 @@ const sectorMap=new Map(); data.results.forEach(item=>{{const bucket=sectorMap.g
 
 
 def write_dashboard(context: dict[str, Any], title: str, path: str | Path = "index.html") -> None:
+    if not context.get("fund_catalog"):
+        raise RuntimeError("AkShare 全基金目录为空，停止生成不完整的 OCR 工作台")
     generated_data_page = build_dashboard(context, title)
     mobile_template_path = Path("artifact.html")
     if mobile_template_path.exists():

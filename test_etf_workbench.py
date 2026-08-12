@@ -4,6 +4,7 @@ import base64
 import gzip
 import json
 import sys
+import tempfile
 import types
 
 import pandas as pd
@@ -76,6 +77,16 @@ class MarketDataTests(unittest.TestCase):
         encoded = page.split(marker, 1)[1].split('"', 1)[0]
         decoded = json.loads(gzip.decompress(base64.b64decode(encoded)))
         self.assertEqual(decoded, context["fund_catalog"])
+
+    def test_dashboard_write_rejects_missing_ocr_catalog(self):
+        context = {
+            "now": workbench.datetime.now(workbench.BEIJING_TZ),
+            "mode": "morning", "dynamic_count": 0, "watch_count": 0,
+            "results": [], "failures": [], "fund_catalog": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError, "全基金目录为空"):
+                workbench.write_dashboard(context, "test", f"{directory}/index.html")
 
 
 if __name__ == "__main__":
