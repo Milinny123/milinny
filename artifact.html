@@ -442,6 +442,22 @@
         // storage is only used for edits made in this browser.
         let userHoldings = JSON.parse(localStorage.getItem('user_holdings_v1') || '[]');
 
+        // A one-time sync link can seed this browser without publishing holdings
+        // in the generated dashboard payload or overwriting later local edits.
+        (function applyOneTimeHoldingSync() {
+            const prefix = '#holdings=';
+            if (!location.hash.startsWith(prefix)) return;
+            try {
+                const incoming = JSON.parse(decodeURIComponent(location.hash.slice(prefix.length)));
+                if (Array.isArray(incoming) && incoming.length && !localStorage.getItem('user_holdings_sync_ba0bb01')) {
+                    userHoldings = incoming;
+                    localStorage.setItem('user_holdings_v1', JSON.stringify(userHoldings));
+                    localStorage.setItem('user_holdings_sync_ba0bb01', '1');
+                    history.replaceState(null, '', location.pathname + location.search);
+                }
+            } catch (error) { console.warn('持仓同步片段无效', error); }
+        }());
+
         let tempParsedOcrHoldings = [];
         let fundCatalog = [];
 
