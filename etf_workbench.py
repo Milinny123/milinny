@@ -167,7 +167,12 @@ def load_holdings(path: str | Path = HOLDINGS_PATH) -> list[dict[str, Any]]:
         kind = str(raw.get("kind", "")).strip()
         if not name or not _is_alipay_fund(kind):
             raise ValueError(f"第 {index} 笔持仓缺少名称或基金类别无效")
-        buy_date = datetime.strptime(str(raw.get("buy_date", "")), "%Y-%m-%d").date()
+        buy_date_raw = raw.get("buy_date")
+        buy_date = (
+            None
+            if buy_date_raw in (None, "")
+            else datetime.strptime(str(buy_date_raw), "%Y-%m-%d").date()
+        )
         amount = float(raw.get("amount", 0))
         if amount <= 0:
             raise ValueError(f"第 {index} 笔持仓金额必须大于 0")
@@ -184,7 +189,7 @@ def load_holdings(path: str | Path = HOLDINGS_PATH) -> list[dict[str, Any]]:
                 "code": code,
                 "name": name,
                 "kind": kind,
-                "buy_date": buy_date.isoformat(),
+                "buy_date": buy_date.isoformat() if buy_date else None,
                 "amount": amount,
                 "cost_nav": cost_nav,
                 "status": status,
@@ -1296,6 +1301,8 @@ def enrich_redemption_fees(
 def _position_advice(position: dict[str, Any], item: dict[str, Any] | None, now: datetime) -> str:
     if position["status"] == "pending":
         return "订单待确认：今天不重复加仓，也不能赎回；确认份额和成交净值后再计算真实盈亏"
+    if not position.get("buy_date"):
+        return "买入确认日待补充：停止新增资金；赎回前在支付宝核对实际持有天数和费率"
     held_days = max(0, (now.astimezone(BEIJING_TZ).date() - datetime.strptime(position["buy_date"], "%Y-%m-%d").date()).days)
     if item is None:
         return "行情未获取：保持不动，不依据缺失数据操作"
@@ -1527,6 +1534,11 @@ def _line(item: dict[str, Any]) -> str:
 def _holding_line(position: dict[str, Any]) -> str:
     item = position.get("analysis")
     status = "交易待确认" if position["status"] == "pending" else "已确认"
+    snapshot_text = (
+        f"，截图市值 {position['current_value']:.2f} 元、持有收益 {position['holding_profit']:+.2f} 元"
+        if position.get("current_value") is not None and position.get("holding_profit") is not None
+        else ""
+    )
     return_text = (
         f"，按确认成本估算收益 {position['current_return']:.2f}%"
         if position.get("current_return") is not None
@@ -1539,8 +1551,8 @@ def _holding_line(position: dict[str, Any]) -> str:
         else "；本次行情获取失败"
     )
     return (
-        f"- **{position['code']} {position['name']}**：{position['buy_date']} 买入 "
-        f"{position['amount']:.0f} 元（{status}）{return_text}{signal}；**{position['advice']}**。"
+        f"- **{position['code']} {position['name']}**：{position.get('buy_date') or '日期待确认'} 买入 "
+        f"{position['amount']:.0f} 元（{status}）{snapshot_text}{return_text}{signal}；**{position['advice']}**。"
     )
 
 

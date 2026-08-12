@@ -453,7 +453,7 @@
         }
 
         function normalizeFundText(value) {
-            return String(value || '').toLowerCase().replace(/etf|联接|发起式|指数|证券投资基金|基金|人民币份额|[\s·()（）\-_/]/g, '');
+            return String(value || '').toLowerCase().replace(/etf|联接|发起式|指数|证券投资基金|基金|人民币份额|[\s·()（）\-_/….。]/g, '');
         }
 
         function resolveCatalogFund(query) {
@@ -468,7 +468,8 @@
             const matches = fundCatalog
                 .map(item => {
                     const name = normalizeFundText(item.name);
-                    const overlap = name.includes(normalized) || normalized.includes(name);
+                    const prefix = normalized.length >= 6 && (name.startsWith(normalized) || normalized.startsWith(name));
+                    const overlap = name.includes(normalized) || normalized.includes(name) || prefix;
                     const common = [...new Set(normalized)].filter(char => name.includes(char)).length;
                     const score = overlap ? 1 : common / Math.max(name.length, normalized.length);
                     return { item, score };
@@ -506,7 +507,8 @@
             if (exactCodes.length) return [...found.values()];
             lines.forEach((line, index) => {
                 const nearby = lines.slice(Math.max(0, index - 1), index + 3).join(' ');
-                if (!/\d{6}/.test(line)) {
+                const hasNearbyAmount = /[¥￥]\s*[\d,]+(?:\.\d{1,2})?/.test(nearby);
+                if (!/\d{6}/.test(line) && hasNearbyAmount) {
                     const fund = resolveCatalogFund(line);
                     if (fund && !found.has(fund.code)) {
                         found.set(fund.code, { fundCode: fund.code, fundName: fund.name, holdAmount: extractAmount(nearby, fund.code), buyDate: '', totalProfit: 0, confidence: fund.confidence });

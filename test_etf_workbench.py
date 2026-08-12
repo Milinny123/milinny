@@ -88,6 +88,17 @@ class MarketDataTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "全基金目录为空"):
                 workbench.write_dashboard(context, "test", f"{directory}/index.html")
 
+    def test_holding_with_unknown_buy_date_requires_confirmation(self):
+        position = {
+            "code": "020357", "name": "华夏半导体材料设备ETF联接C",
+            "kind": "alipay_c", "buy_date": None, "amount": 200,
+            "cost_nav": None, "status": "confirmed",
+        }
+        advice = workbench._position_advice(
+            position, None, workbench.datetime.now(workbench.BEIJING_TZ)
+        )
+        self.assertIn("买入确认日待补充", advice)
+
 
 if __name__ == "__main__":
     unittest.main()
