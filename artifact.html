@@ -189,6 +189,22 @@
             </div>
         </section>
 
+        <section class="glass-panel p-5 rounded-2xl space-y-4 border border-amber-500/30" id="portfolio-action-plan">
+            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 pb-3 border-b border-slate-800">
+                <div>
+                    <h2 class="font-bold text-white text-base flex items-center gap-2"><i class="fa-solid fa-list-check text-amber-400"></i>今日操作计划</h2>
+                    <p class="text-xs text-slate-400 mt-1">基于当前持仓、实时动量、回撤和 C 类 7 天赎回费规则生成；仅作决策辅助</p>
+                </div>
+                <span id="action-plan-stamp" class="text-[10px] text-slate-500 font-mono">等待行情数据</span>
+            </div>
+            <div id="holding-actions" class="grid grid-cols-1 lg:grid-cols-2 gap-3"></div>
+            <div>
+                <h3 class="text-sm font-bold text-emerald-300 mb-2"><i class="fa-solid fa-circle-plus mr-1"></i>建议新增观察</h3>
+                <div id="new-fund-actions" class="grid grid-cols-1 lg:grid-cols-3 gap-3"></div>
+            </div>
+            <div id="action-plan-empty" class="hidden text-xs text-slate-500">请先导入或手动添加持仓，系统会生成针对性建议。</div>
+        </section>
+
         <section>
             <div class="flex justify-between items-center mb-4">
                 <h2 class="text-base font-bold text-white flex items-center gap-2">
@@ -690,6 +706,67 @@
             document.getElementById('port-total-profit').innerText = `￥${totalHistProfit.toFixed(2)}`;
             document.getElementById('port-penalty-warning').innerText = `${penaltyCount} 只锁定中`;
             document.getElementById('user-holding-count-badge').innerText = `${userHoldings.length} 只持仓标的`;
+            renderActionPlan();
+        }
+
+        function actionPlanAmount(item, ratio) {
+            return Math.max(10, Math.round((Number(item.amount) || 0) * ratio));
+        }
+
+        function renderActionPlan() {
+            const holdingBox = document.getElementById('holding-actions');
+            const newBox = document.getElementById('new-fund-actions');
+            const empty = document.getElementById('action-plan-empty');
+            if (!holdingBox || !newBox) return;
+            holdingBox.replaceChildren(); newBox.replaceChildren();
+            if (!userHoldings.length) { empty?.classList.remove('hidden'); return; }
+            empty?.classList.add('hidden');
+            const heldCodes = new Set(userHoldings.map(item => item.code));
+            const sectorAmounts = {};
+            userHoldings.forEach(item => {
+                const fund = processedData.find(row => row.code === item.code);
+                const sector = fund?.sector || '其他';
+                sectorAmounts[sector] = (sectorAmounts[sector] || 0) + Number(item.amount || 0);
+            });
+            const total = userHoldings.reduce((sum, item) => sum + Number(item.amount || 0), 0) || 1;
+            userHoldings.forEach(item => {
+                const fund = processedData.find(row => row.code === item.code);
+                const days = calculateDaysHeld(item.buyDate);
+                const locked = days !== null && days < 7;
+                const est = Number(fund?.est || 0);
+                const score = Number(fund?.score || 0);
+                const drawdown = Number(fund?.drawdown || 0);
+                let action = '继续持有', tone = 'text-slate-200', detail = '动量和回撤暂未触发调整条件。';
+                if (drawdown <= -8 || fund?.stopLoss) {
+                    action = locked ? '大跌避险：仅减仓 25%' : '减仓 25% - 50%'; tone = 'text-red-400';
+                    detail = `高点回撤 ${drawdown.toFixed(1)}%，触发组合止损线；${locked ? '未满 7 天，按避险优先。' : '已过 7 天，可分批执行。'}`;
+                } else if (est < -2 && !locked) {
+                    action = '减仓 20%'; tone = 'text-amber-300'; detail = `今日估算 ${est.toFixed(2)}%，且已过 7 天，建议降低弱势敞口。`;
+                } else if (est >= 2 && score >= 2.5) {
+                    const concentration = (sectorAmounts[fund?.sector || '其他'] || 0) / total;
+                    action = concentration >= 0.35 ? '持有，不再追涨' : '持有，可加仓 10%'; tone = 'text-emerald-300';
+                    detail = `今日估算 +${est.toFixed(2)}%，动量 ${score.toFixed(2)}；${concentration >= 0.35 ? '同赛道占比已偏高。' : '组合占比尚未集中。'}`;
+                } else if (locked) {
+                    action = '继续持有，暂不赎回'; tone = 'text-amber-300'; detail = days === null ? '买入日期待确认，先核对确认日和费率。' : `已持 ${days} 天，距离 7 天解冻还有 ${7 - days} 天。`;
+                }
+                const card = document.createElement('div');
+                card.className = 'p-3 bg-slate-900/80 border border-slate-800 rounded-xl text-xs';
+                card.innerHTML = `<div class="flex justify-between gap-2"><strong class="text-white truncate">${item.name}</strong><strong class="${tone} whitespace-nowrap">${action}</strong></div><div class="text-slate-400 mt-1 font-mono">${item.code} · ${fund?.sector || '其他'} · ${fund ? `估算 ${est >= 0 ? '+' : ''}${est.toFixed(2)}% / 得分 ${score.toFixed(2)}` : '暂无当日行情'}</div><div class="text-slate-300 mt-2 leading-relaxed">${detail}</div>`;
+                holdingBox.appendChild(card);
+            });
+            const candidates = processedData.filter(item => !heldCodes.has(item.code) && Number(item.est) > 0 && Number(item.quality || 0) >= 55 && Number(item.score || 0) > 1.5)
+                .sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
+            const selected = [];
+            candidates.forEach(item => { if (selected.length < 3 && !selected.some(row => row.sector === item.sector)) selected.push(item); });
+            selected.forEach(item => {
+                const card = document.createElement('div');
+                card.className = 'p-3 bg-emerald-500/5 border border-emerald-500/20 rounded-xl text-xs';
+                card.innerHTML = `<div class="flex justify-between gap-2"><strong class="text-white truncate">${item.name}</strong><strong class="text-emerald-300 whitespace-nowrap">试投 ￥200</strong></div><div class="text-slate-400 mt-1 font-mono">${item.code} · ${item.sector} · 估算 +${Number(item.est).toFixed(2)}% · 得分 ${Number(item.score).toFixed(2)}</div><div class="text-slate-300 mt-2">先观察成交和估算质量，单只不超过可用资金 10%。</div><button class="mt-2 text-emerald-300 hover:text-emerald-200" onclick="addFundToHoldings('${item.code}', '${item.name.replace(/'/g, "\\'")}')">加入持仓</button>`;
+                newBox.appendChild(card);
+            });
+            if (!selected.length) newBox.innerHTML = '<div class="text-xs text-slate-500">当前没有同时满足动量、质量和分散化条件的新增标的，建议观望。</div>';
+            const stamp = document.getElementById('action-plan-stamp');
+            if (stamp) stamp.textContent = `更新 ${new Date().toLocaleTimeString('zh-CN', {hour12: false})}`;
         }
 
         async function handleFileSelect(file) {
