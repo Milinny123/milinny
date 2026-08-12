@@ -445,6 +445,13 @@
         let tempParsedOcrHoldings = [];
         let fundCatalog = [];
 
+        async function decodeFundCatalog(encoded) {
+            if (!encoded || !window.DecompressionStream) return [];
+            const bytes = Uint8Array.from(atob(encoded), char => char.charCodeAt(0));
+            const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+            return JSON.parse(await new Response(stream).text());
+        }
+
         function normalizeFundText(value) {
             return String(value || '').toLowerCase().replace(/etf|联接|发起式|指数|证券投资基金|基金|人民币份额|[\s·()（）\-_/]/g, '');
         }
@@ -717,7 +724,7 @@
                     freshness: item.data_freshness || '历史净值/行情'
                 })).sort((a, b) => b.score - a.score);
                 if (liveData.length) processedData = liveData;
-                fundCatalog = Array.isArray(payload.fund_catalog) ? payload.fund_catalog : [];
+                fundCatalog = await decodeFundCatalog(payload.fund_catalog_gzip);
                 if (!fundCatalog.length) {
                     fundCatalog = liveData.map(item => ({ code: item.code, name: item.name }));
                 }

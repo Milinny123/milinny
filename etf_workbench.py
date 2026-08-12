@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import html
+import base64
+import gzip
 import json
 import math
 import os
@@ -1745,6 +1747,10 @@ def _dashboard_decision_card(item: dict[str, Any]) -> str:
 def build_dashboard(context: dict[str, Any], title: str) -> str:
     now: datetime = context["now"]
     results = context["results"]
+    catalog_json = json.dumps(
+        context.get("fund_catalog", []), ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    catalog_gzip = base64.b64encode(gzip.compress(catalog_json, compresslevel=9)).decode("ascii")
     payload = {
         "updated": now.isoformat(),
         "title": title,
@@ -1760,7 +1766,7 @@ def build_dashboard(context: dict[str, Any], title: str) -> str:
         "holdings": [],
         "invested_amount": 0,
         "remaining_cash": TOTAL_CAPITAL,
-        "fund_catalog": context.get("fund_catalog", []),
+        "fund_catalog_gzip": catalog_gzip,
         "failures": context["failures"],
     }
     data_json = json.dumps(payload, ensure_ascii=False, default=str).replace("</", "<\\/")

@@ -1,5 +1,8 @@
 import unittest
 from datetime import date
+import base64
+import gzip
+import json
 import sys
 import types
 
@@ -60,6 +63,19 @@ class MarketDataTests(unittest.TestCase):
         rows = [broad, spike]
         workbench._calculate_composite_scores(rows)
         self.assertGreater(broad["composite_score"], spike["composite_score"])
+
+    def test_dashboard_embeds_compressed_fund_catalog(self):
+        context = {
+            "now": workbench.datetime.now(workbench.BEIJING_TZ),
+            "mode": "morning", "dynamic_count": 0, "watch_count": 0,
+            "results": [], "failures": [],
+            "fund_catalog": [{"code": "017937", "name": "易方达中证医疗ETF联接发起式A"}],
+        }
+        page = workbench.build_dashboard(context, "test")
+        marker = '"fund_catalog_gzip": "'
+        encoded = page.split(marker, 1)[1].split('"', 1)[0]
+        decoded = json.loads(gzip.decompress(base64.b64decode(encoded)))
+        self.assertEqual(decoded, context["fund_catalog"])
 
 
 if __name__ == "__main__":
